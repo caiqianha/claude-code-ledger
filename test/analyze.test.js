@@ -18,11 +18,11 @@ async function load() {
 
 test("streaming-split messages are counted once", async () => {
   const { model, report } = await load();
-  assert.equal(model.messages.size, 8);
-  assert.equal(report.totals.messages, 8);
+  assert.equal(model.messages.size, 11);
+  assert.equal(report.totals.messages, 11);
   // msg_1 usage counted once: input 10, not 20
   const t = report.totals;
-  assert.equal(t.input, 10 + 5 * 7);
+  assert.equal(t.input, 10 + 5 * 9 + 1_000_000);
   assert.equal(t.cacheWrite, 2000);
 });
 
@@ -35,7 +35,7 @@ test("tool calls joined with results and errors", async () => {
   const { report } = await load();
   const bash = report.byTool.find((t) => t.key === "Bash");
   const read = report.byTool.find((t) => t.key === "Read");
-  assert.equal(read.calls, 4);
+  assert.equal(read.calls, 6);
   assert.equal(bash.calls, 3);
   assert.equal(bash.errors, 1);
   assert.equal(bash.maxResultChars, 40_000);
@@ -72,7 +72,7 @@ test("session metadata", async () => {
   const s = report.bySession[0].session;
   assert.equal(s.project, "demo-app");
   assert.equal(s.humanTurns, 1);
-  assert.equal(s.compactions, 1);
+  assert.equal(s.compactions.length, 2);
   assert.ok(totalTokens(report.bySession[0]) > 0);
 });
 

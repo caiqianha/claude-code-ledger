@@ -42,7 +42,6 @@ function maxUsage(a, b) {
 
 function projectName(rec) {
   if (rec.cwd) return rec.cwd.split(/[\\/]/).filter(Boolean).pop() || rec.cwd;
-  // Encoded dir names look like "-Users-me-code-my-app"; take the trailing segment best-effort.
   return rec._projectDir || "unknown";
 }
 
@@ -56,7 +55,7 @@ function stable(v) {
 export function describeInput(name, input) {
   if (!input || typeof input !== "object") return { key: name, preview: "" };
   const p = input.file_path || input.path || input.notebook_path || "";
-  let key, preview;
+  let key;
   switch (name) {
     case "Read":
       key = `${p}${input.offset ? ` @${input.offset}` : ""}${input.limit ? ` +${input.limit}` : ""}`;
@@ -80,10 +79,30 @@ export function describeInput(name, input) {
     case "WebSearch":
       key = String(input.query || "");
       break;
+    case "Agent":
+    case "Task":
+      key = String(input.description || input.subagent_type || "").trim();
+      break;
     default:
-      key = stable(input).slice(0, 300);
+      if (name.startsWith("mcp__")) {
+        // Friendlier than raw JSON: the string-valued fields, in a stable order.
+        // Flatten one level so {path:{document_id:"x"}} reads as document_id=x.
+        const flat = {};
+        for (const [k, v] of Object.entries(input)) {
+          if (v && typeof v === "object" && !Array.isArray(v)) for (const [k2, v2] of Object.entries(v)) flat[k2] = v2;
+          else flat[k] = v;
+        }
+        const parts = Object.keys(flat)
+          .sort()
+          .filter((k) => (typeof flat[k] === "string" && flat[k].length) || typeof flat[k] === "number")
+          .map((k) => `${k}=${flat[k]}`);
+        key = parts.length ? parts.join(" ") : stable(input);
+      } else {
+        key = stable(input);
+      }
+      key = key.slice(0, 300);
   }
-  preview = key.length > 80 ? key.slice(0, 77) + "..." : key;
+  const preview = key.length > 80 ? key.slice(0, 77) + "..." : key;
   return { key: `${name} ${key}`, preview };
 }
 
@@ -96,7 +115,7 @@ function resultChars(content) {
       if (!b) continue;
       if (typeof b === "string") n += b.length;
       else if (typeof b.text === "string") n += b.text.length;
-      else if (b.type === "image") n += 1500; // rough token-equivalent placeholder
+      else if (b.type === "image") n += 6000; // ~1.5k tokens, expressed in chars
     }
     return n;
   }
@@ -116,7 +135,7 @@ export function newModel() {
     toolResults: new Map(), // tool_use.id -> result
     sessions: new Map(), // sessionId -> session
     costStates: new Map(), // sessionId -> last cost-state record
-    stats: { lines: 0, files: new Set() },
+    stats: { lines: 0 },
   };
 }
 
@@ -129,13 +148,15 @@ function session(model, rec) {
       project: projectName(rec),
       projectDir: rec._projectDir,
       cwd: rec.cwd || null,
+      file: rec._file || null,
       firstTs: null,
       lastTs: null,
       version: rec.version || null,
       gitBranch: rec.gitBranch || null,
       slug: rec.slug || null,
       humanTurns: 0,
-      compactions: 0,
+      compactions: [], // timestamps of compact_boundary records
+      seq: 0,
     };
     model.sessions.set(id, s);
   }
@@ -155,12 +176,13 @@ function session(model, rec) {
   return s;
 }
 
-/** Consume an (async) iterable of records into a model. */
+/** Consume an (async or sync) iterable of records into a model. Safe to call repeatedly (incremental). */
 export async function buildModel(records, model = newModel()) {
   for await (const rec of records) {
     model.stats.lines++;
     const s = session(model, rec);
     const ts = rec.timestamp ? Date.parse(rec.timestamp) : NaN;
+    const sidechain = rec.isSidechain === true;
 
     if (rec.type === "assistant" && rec.message) {
       const m = rec.message;
@@ -174,6 +196,8 @@ export async function buildModel(records, model = newModel()) {
           sessionId: s.id,
           model: m.model || "unknown",
           ts: Number.isNaN(ts) ? null : ts,
+          seq: s.seq++,
+          sidechain,
           usage: u,
           toolUseIds: [],
           stopReason: m.stop_reason || null,
@@ -195,7 +219,9 @@ export async function buildModel(records, model = newModel()) {
           preview,
           inputChars: b.input ? stable(b.input).length : 0,
           messageId: id,
+          model: msg.model,
           sessionId: s.id,
+          sidechain,
           ts: Number.isNaN(ts) ? null : ts,
         });
         msg.toolUseIds.push(b.id);
@@ -205,7 +231,7 @@ export async function buildModel(records, model = newModel()) {
 
     if (rec.type === "user" && rec.message) {
       const content = rec.message.content;
-      if (isHumanTurn(content) && !rec.isMeta) s.humanTurns++;
+      if (isHumanTurn(content) && !rec.isMeta && !sidechain) s.humanTurns++;
       if (!Array.isArray(content)) continue;
       for (const b of content) {
         if (!b || b.type !== "tool_result" || !b.tool_use_id) continue;
@@ -226,7 +252,7 @@ export async function buildModel(records, model = newModel()) {
     }
 
     if (rec.type === "system" && rec.subtype === "compact_boundary") {
-      s.compactions++;
+      s.compactions.push(Number.isNaN(ts) ? s.lastTs || 0 : ts);
     }
   }
   return model;

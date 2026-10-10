@@ -10,14 +10,17 @@ export function newStat() {
     cacheWrite: 0,
     thinking: 0,
     est: 0,
+    sub: 0, // est spent by subagents (sidechain messages)
     unknownModel: false,
     toolCalls: 0,
     toolErrors: 0,
     resultChars: 0,
+    ctxCost: 0, // attributed context cost of tool results (see attribute())
+    reported: null,
   };
 }
 
-function addUsage(st, u, cost) {
+function addUsage(st, u, cost, sidechain) {
   st.messages++;
   st.input += u.input;
   st.output += u.output;
@@ -25,7 +28,10 @@ function addUsage(st, u, cost) {
   st.cacheWrite += u.cacheWrite5m + u.cacheWrite1h;
   st.thinking += u.thinking;
   if (cost === null) st.unknownModel = true;
-  else st.est += cost;
+  else {
+    st.est += cost;
+    if (sidechain) st.sub += cost;
+  }
 }
 
 export function totalTokens(st) {
@@ -37,7 +43,7 @@ export function cacheHitRate(st) {
   return denom ? st.cacheRead / denom : 0;
 }
 
-function localDay(ts) {
+export function localDay(ts) {
   return new Date(ts).toLocaleDateString("sv-SE"); // YYYY-MM-DD in local time
 }
 
@@ -50,9 +56,28 @@ function bump(map, key, init) {
   return v;
 }
 
+/** Number of elements in a sorted numeric array strictly greater than x. */
+function countAfter(sorted, x) {
+  let lo = 0,
+    hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] <= x) lo = mid + 1;
+    else hi = mid;
+  }
+  return sorted.length - lo;
+}
+
+/** Index of the compaction epoch a timestamp falls in (0 = before any compaction). */
+export function epochOf(compactions, ts) {
+  let n = 0;
+  for (const c of compactions) if (c <= ts) n++;
+  return n;
+}
+
 /**
  * Aggregate a parsed model.
- * opts: { pricing, since?: ms, until?: ms, project?: string, largeOutput?: chars, repeatMin?: n }
+ * opts: { pricing, since?, until?, project?, largeOutput?, repeatMin?, charsPerToken? }
  */
 export function analyze(model, opts) {
   const { pricing } = opts;
@@ -61,6 +86,7 @@ export function analyze(model, opts) {
   const projFilter = opts.project ? opts.project.toLowerCase() : null;
   const largeOutput = opts.largeOutput ?? 30_000;
   const repeatMin = opts.repeatMin ?? 4;
+  const cpt = opts.charsPerToken ?? 4;
 
   const sessionOk = (s) =>
     !projFilter ||
@@ -75,72 +101,113 @@ export function analyze(model, opts) {
   const byModel = new Map();
   const bySession = new Map();
   const byTool = new Map();
-  const includedSessions = new Set();
+  const sessionDayEst = new Map(); // sid -> Map(day -> est), for apportioning reported cost
+  const sessionMsgTs = new Map(); // sid -> sorted message timestamps (all, unfiltered) for attribution
+  const sessionModelEst = new Map(); // sid -> Map(model -> est), to find each session's primary model
+
+  for (const msg of model.messages.values()) {
+    if (msg.ts !== null) bump(sessionMsgTs, msg.sessionId, () => []).push(msg.ts);
+  }
+  for (const arr of sessionMsgTs.values()) arr.sort((a, b) => a - b);
 
   // ---- messages / tokens ----
   for (const msg of model.messages.values()) {
     const s = model.sessions.get(msg.sessionId);
     if (!s || !sessionOk(s) || !tsOk(msg.ts)) continue;
-    includedSessions.add(s.id);
     const cost = costOf(msg.usage, resolvePrice(pricing, msg.model));
-    addUsage(totals, msg.usage, cost);
-    if (msg.ts !== null) addUsage(bump(byDay, localDay(msg.ts), newStat), msg.usage, cost);
-    addUsage(bump(byProject, s.project, newStat), msg.usage, cost);
-    addUsage(bump(byModel, msg.model, newStat), msg.usage, cost);
-    const ss = bump(bySession, s.id, () => ({ ...newStat(), session: s, reported: null }));
-    addUsage(ss, msg.usage, cost);
+    addUsage(totals, msg.usage, cost, msg.sidechain);
+    if (msg.ts !== null) {
+      const day = localDay(msg.ts);
+      addUsage(bump(byDay, day, newStat), msg.usage, cost, msg.sidechain);
+      const sd = bump(sessionDayEst, s.id, () => new Map());
+      sd.set(day, (sd.get(day) || 0) + (cost || 0));
+    }
+    addUsage(bump(byProject, s.project, newStat), msg.usage, cost, msg.sidechain);
+    addUsage(bump(byModel, msg.model, newStat), msg.usage, cost, msg.sidechain);
+    addUsage(bump(bySession, s.id, () => ({ ...newStat(), session: s })), msg.usage, cost, msg.sidechain);
+    const sm = bump(sessionModelEst, s.id, () => new Map());
+    sm.set(msg.model, (sm.get(msg.model) || 0) + (cost || 0));
+  }
+  for (const [sid, sm] of sessionModelEst) {
+    const ss = bySession.get(sid);
+    const total = [...sm.values()].reduce((a, b) => a + b, 0);
+    const [top, topEst] = [...sm.entries()].sort((a, b) => b[1] - a[1])[0];
+    ss.primaryModel = total && topEst / total >= 0.9 ? top : null;
   }
 
-  // ---- tool calls ----
+  // ---- tool calls, with context-cost attribution ----
   const calls = [];
   for (const call of model.toolUses.values()) {
     const s = model.sessions.get(call.sessionId);
     if (!s || !sessionOk(s) || !tsOk(call.ts)) continue;
     const res = model.toolResults.get(call.id) || null;
-    const rec = { ...call, result: res, project: s.project };
+    const rec = { ...call, result: res, project: s.project, epoch: call.ts !== null ? epochOf(s.compactions, call.ts) : 0, ctxCost: 0, alive: 0, ms: null };
+    if (res) {
+      if (res.ts !== null && call.ts !== null) rec.ms = Math.max(0, res.ts - call.ts);
+      attribute(rec, s, sessionMsgTs.get(s.id) || [], pricing, cpt);
+    }
     calls.push(rec);
-    const t = bump(byTool, call.name, () => ({
-      name: call.name,
-      calls: 0,
-      errors: 0,
-      noResult: 0,
-      resultChars: 0,
-      maxResultChars: 0,
-      inputChars: 0,
-    }));
+
+    const t = bump(byTool, call.name, () => ({ name: call.name, calls: 0, errors: 0, resultChars: 0, maxResultChars: 0, inputChars: 0, ctxCost: 0, msTotal: 0, msCount: 0 }));
     t.calls++;
     t.inputChars += call.inputChars;
-    if (!res) t.noResult++;
-    else {
+    if (res) {
       if (res.isError) t.errors++;
       t.resultChars += res.chars;
       if (res.chars > t.maxResultChars) t.maxResultChars = res.chars;
+      t.ctxCost += rec.ctxCost;
+      if (rec.ms !== null) {
+        t.msTotal += rec.ms;
+        t.msCount++;
+      }
     }
     const bumpStat = (st) => {
       st.toolCalls++;
       if (res?.isError) st.toolErrors++;
-      if (res) st.resultChars += res.chars;
+      if (res) {
+        st.resultChars += res.chars;
+        st.ctxCost += rec.ctxCost;
+      }
     };
     bumpStat(totals);
     if (call.ts !== null) bumpStat(bump(byDay, localDay(call.ts), newStat));
     bumpStat(bump(byProject, s.project, newStat));
-    bumpStat(bump(bySession, s.id, () => ({ ...newStat(), session: s, reported: null })));
+    bumpStat(bump(bySession, s.id, () => ({ ...newStat(), session: s })));
   }
 
-  // ---- reported cost from Claude Code's own cost-state (cumulative per session) ----
+  // ---- reported cost (Claude Code cost-state, cumulative per session), apportioned to days by est share ----
   let reported = 0;
   let reportedSessions = 0;
   for (const [sid, ss] of bySession) {
     const cs = model.costStates.get(sid);
-    if (cs && typeof cs.totalCostUSD === "number") {
-      ss.reported = cs.totalCostUSD;
-      ss.linesAdded = cs.totalLinesAdded || 0;
-      ss.linesRemoved = cs.totalLinesRemoved || 0;
-      ss.apiMs = cs.totalAPIDuration || 0;
-      ss.toolMs = cs.totalToolDuration || 0;
-      reported += cs.totalCostUSD;
-      reportedSessions++;
+    if (!cs || typeof cs.totalCostUSD !== "number") continue;
+    ss.reported = cs.totalCostUSD;
+    ss.linesAdded = cs.totalLinesAdded || 0;
+    ss.linesRemoved = cs.totalLinesRemoved || 0;
+    ss.apiMs = cs.totalAPIDuration || 0;
+    ss.toolMs = cs.totalToolDuration || 0;
+    reported += cs.totalCostUSD;
+    reportedSessions++;
+    const sd = sessionDayEst.get(sid);
+    if (sd) {
+      const total = [...sd.values()].reduce((a, b) => a + b, 0);
+      for (const [day, est] of sd) {
+        const d = byDay.get(day);
+        if (!d) continue;
+        d.reported = (d.reported || 0) + (total ? (cs.totalCostUSD * est) / total : cs.totalCostUSD / sd.size);
+      }
     }
+  }
+
+  // ---- context cost by key (file / command / query) ----
+  const byContext = new Map();
+  for (const c of calls) {
+    if (!c.result) continue;
+    const k = bump(byContext, c.key, () => ({ key: c.key, tool: c.name, preview: c.preview, calls: 0, chars: 0, ctxCost: 0, sessions: new Set() }));
+    k.calls++;
+    k.chars += c.result.chars;
+    k.ctxCost += c.ctxCost;
+    k.sessions.add(c.sessionId);
   }
 
   const waste = detectWaste(calls, bySession, { largeOutput, repeatMin });
@@ -154,9 +221,30 @@ export function analyze(model, opts) {
     byModel: sortBy(byModel, (v) => -v.est),
     bySession: sortBy(bySession, (v) => -(v.reported ?? v.est)),
     byTool: sortBy(byTool, (v) => -v.calls),
+    byContext: [...byContext.values()].map((k) => ({ ...k, sessions: k.sessions.size })).sort((a, b) => b.ctxCost - a.ctxCost),
     waste,
-    sessionsIncluded: includedSessions.size,
+    sessionsIncluded: bySession.size,
+    calibration: calibrate(model, bySession),
   };
+}
+
+/**
+ * Context-cost attribution. A tool result enters the prompt once (cache write) and is
+ * then re-read on every later API message in the same session until the next compaction.
+ * cost ≈ tokens × (cache_write_1h + cache_read × later_messages). It is an estimate, but a
+ * consistent one, so it ranks tools and files fairly against each other.
+ */
+function attribute(rec, s, msgTs, pricing, cpt) {
+  const price = resolvePrice(pricing, rec.model);
+  if (!price || rec.result.ts === null) return;
+  const nextCompaction = s.compactions.find((c) => c > rec.result.ts);
+  let alive = countAfter(msgTs, rec.result.ts);
+  if (nextCompaction !== undefined) alive -= countAfter(msgTs, nextCompaction);
+  const tokens = rec.result.chars / cpt;
+  const write = price.cache_write_1h ?? price.input * 2;
+  const read = price.cache_read ?? price.input * 0.1;
+  rec.alive = alive;
+  rec.ctxCost = (tokens / 1e6) * (write + read * alive);
 }
 
 function sortMap(map) {
@@ -167,22 +255,43 @@ function sortBy(map, score) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Calibration: compare our estimate with Claude Code's own cost-state  */
+/* ------------------------------------------------------------------ */
+
+export function calibrate(_model, bySession) {
+  const perModel = new Map(); // model -> ratios[]
+  const rows = [];
+  for (const ss of bySession.values()) {
+    if (ss.reported == null || ss.est <= 0 || ss.unknownModel) continue;
+    const ratio = ss.reported / ss.est;
+    rows.push({ sessionId: ss.session.id, model: ss.primaryModel || null, est: ss.est, reported: ss.reported, ratio });
+    if (ss.primaryModel) bump(perModel, ss.primaryModel, () => []).push(ratio);
+  }
+  const models = [...perModel.entries()].map(([m, rs]) => {
+    rs.sort((a, b) => a - b);
+    return { model: m, sessions: rs.length, median: rs[rs.length >> 1], min: rs[0], max: rs[rs.length - 1] };
+  });
+  return { sessions: rows, models };
+}
+
+/* ------------------------------------------------------------------ */
 /* Waste detection                                                     */
 /* ------------------------------------------------------------------ */
 
 export function detectWaste(calls, bySession, { largeOutput, repeatMin }) {
   const findings = [];
 
-  // 1. Same read-like call repeated in one session.
+  // 1. Same read-like call repeated within one compaction epoch of one session.
   const groups = new Map();
   for (const c of calls) {
     if (!isReadLike(c.name)) continue;
-    const g = bump(groups, `${c.sessionId}\u0000${c.key}`, () => ({ c, list: [] }));
-    g.list.push(c);
+    bump(groups, `${c.sessionId}\u0000${c.epoch}\u0000${c.key}`, () => []).push(c);
   }
-  for (const { c, list } of groups.values()) {
+  for (const list of groups.values()) {
     if (list.length < repeatMin) continue;
+    const c = list[0];
     const chars = list.reduce((n, x) => n + (x.result?.chars || 0), 0);
+    const usd = list.slice(1).reduce((n, x) => n + x.ctxCost, 0); // everything after the first read is waste
     findings.push({
       kind: "repeat",
       severity: list.length >= repeatMin + 3 ? "high" : "medium",
@@ -191,6 +300,7 @@ export function detectWaste(calls, bySession, { largeOutput, repeatMin }) {
       tool: c.name,
       count: list.length,
       chars,
+      usd,
       detail: c.preview,
       hint: "Same call repeated in one session; the output was already in context. Read a narrower range or keep notes.",
     });
@@ -203,8 +313,12 @@ export function detectWaste(calls, bySession, { largeOutput, repeatMin }) {
     if (list.length < 2) continue;
     list.sort((a, b) => (a.ts || 0) - (b.ts || 0));
     let retries = 0;
+    let usd = 0;
     for (let i = 1; i < list.length; i++) {
-      if (list[i - 1].result?.isError) retries++;
+      if (list[i - 1].result?.isError) {
+        retries++;
+        usd += list[i].ctxCost;
+      }
     }
     if (!retries) continue;
     const c = list[0];
@@ -216,6 +330,7 @@ export function detectWaste(calls, bySession, { largeOutput, repeatMin }) {
       tool: c.name,
       count: retries,
       chars: 0,
+      usd,
       detail: c.preview,
       hint: "Identical call re-issued after it failed. Change the input before retrying.",
     });
@@ -233,6 +348,7 @@ export function detectWaste(calls, bySession, { largeOutput, repeatMin }) {
       tool: c.name,
       count: 1,
       chars,
+      usd: c.ctxCost,
       detail: c.preview,
       hint: "Large tool output is re-sent on every later turn until compaction. Filter with head/grep or use limit.",
     });
@@ -255,6 +371,7 @@ export function detectWaste(calls, bySession, { largeOutput, repeatMin }) {
       tool: t.c.name,
       count: t.errors,
       chars: 0,
+      usd: 0,
       detail: `${t.errors}/${t.calls} calls failed`,
       hint: "A tool failing this often usually means a permission rule, a missing binary, or a wrong working directory.",
     });
@@ -273,12 +390,13 @@ export function detectWaste(calls, bySession, { largeOutput, repeatMin }) {
       tool: "-",
       count: 1,
       chars: totalTokens(ss),
+      usd: 0,
       detail: `cache hit ${(hit * 100).toFixed(0)}%`,
       hint: "Long idle gaps (past the cache TTL) or a changing system prompt make every turn re-pay the full prefix.",
     });
   }
 
   const rank = { high: 0, medium: 1, low: 2 };
-  findings.sort((a, b) => rank[a.severity] - rank[b.severity] || b.chars - a.chars || b.count - a.count);
+  findings.sort((a, b) => rank[a.severity] - rank[b.severity] || b.usd - a.usd || b.chars - a.chars || b.count - a.count);
   return findings;
 }

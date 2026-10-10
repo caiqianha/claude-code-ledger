@@ -57,6 +57,7 @@ export async function* iterRecords(files) {
       if (!rec || typeof rec !== "object") continue;
       rec._projectDir = projectDir;
       rec._fileSession = fileSession;
+      rec._file = file;
       yield rec;
     }
   }

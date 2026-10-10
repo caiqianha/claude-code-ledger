@@ -1,7 +1,7 @@
 {
   "name": "claude-code-ledger",
-  "version": "0.1.0",
-  "description": "Local-first cost & tool-call audit for Claude Code. Reads ~/.claude/projects/*.jsonl, never your message content.",
+  "version": "0.2.0",
+  "description": "Local-first cost & tool-call audit for Claude Code: per-tool context cost, waste detection, CLAUDE.md advice, live watch, HTML report. Never reads your message content.",
   "type": "module",
   "bin": {
     "ccledger": "./bin/ccledger.js"
@@ -32,7 +32,11 @@
     "usage",
     "audit",
     "tool-calls",
-    "cli"
+    "cli",
+    "context",
+    "waste",
+    "hooks",
+    "report"
   ],
   "license": "MIT",
   "repository": {
