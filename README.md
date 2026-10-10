@@ -1,8 +1,8 @@
 # ccledger
 
-[![npm](https://img.shields.io/npm/v/ccledger?color=cb3837)](https://www.npmjs.com/package/ccledger)
+[![npm](https://img.shields.io/npm/v/claude-code-ledger?color=cb3837)](https://www.npmjs.com/package/claude-code-ledger)
 [![license](https://img.shields.io/github/license/caiqianha/claude-code-ledger)](./LICENSE)
-[![node](https://img.shields.io/node/v/ccledger)](./package.json)
+[![node](https://img.shields.io/node/v/claude-code-ledger)](./package.json)
 ![deps](https://img.shields.io/badge/dependencies-0-success)
 
 **Local-first cost & tool-call audit for [Claude Code](https://claude.com/claude-code).**
@@ -28,10 +28,11 @@ Each finding comes with a one-line hint you can turn into a `CLAUDE.md` rule or 
 ## Install
 
 ```bash
-npm install -g ccledger      # or: npx ccledger
+npm install -g claude-code-ledger   # installs the `ccledger` command
+npx claude-code-ledger              # or run it once without installing
 ```
 
-Node 18+. Zero runtime dependencies.
+Node 18+. Zero runtime dependencies. The npm package is `claude-code-ledger`; the CLI is `ccledger`.
 
 ## Usage
 
@@ -135,9 +136,10 @@ Contributions welcome. Run `npm test` before opening a PR.
 - 每条浪费项附带一句建议，可直接写进 `CLAUDE.md` 或做成 hook。
 
 ```bash
-npx ccledger                 # 总览
-npx ccledger daily --since 7d
-npx ccledger waste
+npm i -g claude-code-ledger   # 安装后命令是 ccledger
+ccledger                      # 总览
+ccledger daily --since 7d
+ccledger waste
 ```
 
 ## License

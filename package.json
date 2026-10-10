@@ -1,5 +1,5 @@
 {
-  "name": "ccledger",
+  "name": "claude-code-ledger",
   "version": "0.1.0",
   "description": "Local-first cost & tool-call audit for Claude Code. Reads ~/.claude/projects/*.jsonl, never your message content.",
   "type": "module",
