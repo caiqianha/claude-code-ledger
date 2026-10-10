@@ -3,14 +3,48 @@
   "version": "0.1.0",
   "description": "Local-first cost & tool-call audit for Claude Code. Reads ~/.claude/projects/*.jsonl, never your message content.",
   "type": "module",
-  "bin": { "ccledger": "./bin/ccledger.js" },
-  "files": ["bin", "src", "pricing.json", "README.md", "LICENSE"],
+  "bin": {
+    "ccledger": "./bin/ccledger.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "pricing.json",
+    "scripts/demo-data.mjs",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node bin/ccledger.js",
-    "test": "node --test test/"
+    "test": "node --test test/",
+    "demo": "node scripts/demo-data.mjs /tmp/ccledger-demo && CCLEDGER_DIR=/tmp/ccledger-demo node bin/ccledger.js",
+    "demo:gif": "node scripts/demo-data.mjs /tmp/ccledger-demo && node scripts/render-gif.mjs"
   },
-  "engines": { "node": ">=18" },
-  "keywords": ["claude-code", "claude", "anthropic", "token", "cost", "usage", "audit", "tool-calls", "cli"],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "anthropic",
+    "token",
+    "cost",
+    "usage",
+    "audit",
+    "tool-calls",
+    "cli"
+  ],
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/caiqianha/claude-code-ledger" }
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/caiqianha/claude-code-ledger"
+  },
+  "homepage": "https://github.com/caiqianha/claude-code-ledger#readme",
+  "bugs": {
+    "url": "https://github.com/caiqianha/claude-code-ledger/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
 }

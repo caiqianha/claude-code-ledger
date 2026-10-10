@@ -1,42 +1,17 @@
 # ccledger
 
+[![npm](https://img.shields.io/npm/v/ccledger?color=cb3837)](https://www.npmjs.com/package/ccledger)
+[![license](https://img.shields.io/github/license/caiqianha/claude-code-ledger)](./LICENSE)
+[![node](https://img.shields.io/node/v/ccledger)](./package.json)
+![deps](https://img.shields.io/badge/dependencies-0-success)
+
 **Local-first cost & tool-call audit for [Claude Code](https://claude.com/claude-code).**
 
+![ccledger demo](https://raw.githubusercontent.com/caiqianha/claude-code-ledger/main/assets/demo.gif)
+
+<sub>Demo recorded on synthetic data from `scripts/demo-data.mjs`. No real session appears anywhere in this repo.</sub>
+
 Reads the session logs Claude Code already writes to `~/.claude/projects/`, and tells you where the tokens went: per day, per project, per session, per model, per tool, plus the call patterns that burn context for nothing.
-
-```
-$ ccledger --since 30d
-
-Totals
-══════
-sessions         41
-API messages     3.4k
-tokens           612.80M  (in 38.1k · out 2.91M · cache rd 591.20M · cache wr 18.55M)
-cache hit        97%
-tool calls       3.2k  (124 errors, 7.91M chars returned)
-estimated cost   $186
-reported cost    $174   (Claude Code cost-state, 38/41 sessions)
-
-Top tools
-═════════
-tool                               calls  errs  err%  out chars   avg    max
-─────────────────────────────────  ─────  ────  ────  ─────────  ────  ─────
-Bash                                1.6k    61    4%      4.12M  2.6k  58.3k
-Read                                 412     5    1%      2.37M  5.8k  61.0k
-Edit                                 298     2    1%      54.9k   184    402
-Grep                                 203     0    0%      611.3k  3.0k  31.7k
-mcp__playwright__browser_snapshot    142     9    6%      522.6k  3.7k   9.8k
-
-Top waste
-═════════
-sev   kind          tool                               n  chars  project     session   detail
-────  ────────────  ─────────────────────────────────  ─  ─────  ──────────  ────────  ─────────────────────────────
-high  repeat        Read                               9  52.2k  web-app     7f3a91c2  src/store/modules/order.js
-high  large-output  Bash                               1  58.3k  api-server  b02e55d8  npm test 2>&1
-high  repeat        mcp__playwright__browser_snapshot  7  25.9k  web-app     7f3a91c2  {"filename":"page.png"}
-high  error-prone   Bash                               6      0  api-server  1c9d47aa  6/11 calls failed
-med   retry         Bash                               2      0  web-app     e4a8b310  docker compose up -d
-```
 
 ## Why
 
@@ -76,9 +51,10 @@ Options
   --since <v>      7d | 24h | today | yesterday | YYYY-MM-DD   (default: all)
   --until <v>      YYYY-MM-DD (inclusive)
   --project <s>    Substring match on project name / path
-  --dir <path>     Log directory (default: ~/.claude/projects)
+  --dir <path>     Log directory (default: $CCLEDGER_DIR or ~/.claude/projects)
   --top <n>        Rows to show in ranked tables (default: 15)
   --large <chars>  "Large output" threshold in characters (default: 30000)
+  --kind <k>       waste only: repeat | retry | large-output | error-prone | cold-cache
   --pricing <f>    Alternate pricing.json
   --json           Print the aggregate as JSON
 ```
@@ -89,7 +65,14 @@ Examples:
 ccledger daily --since 7d
 ccledger sessions --project my-app --top 5
 ccledger waste --since today
+ccledger waste --kind large-output
 ccledger --json --since 30d > usage.json
+```
+
+No logs of your own yet? Try it on synthetic data:
+
+```bash
+npm run demo          # generates /tmp/ccledger-demo and prints a summary
 ```
 
 ## How costs are computed
@@ -117,7 +100,7 @@ Everything runs locally. There is no network access of any kind.
 
 | kind | fires when | typical fix |
 | --- | --- | --- |
-| `repeat` | the same read-like call (Read / Grep / Bash / MCP…) appears ≥3× in one session | read a narrower range, keep notes, add a `CLAUDE.md` rule |
+| `repeat` | the same read-like call (Read / Grep / Bash / MCP…) appears ≥4× in one session | read a narrower range, keep notes, add a `CLAUDE.md` rule |
 | `retry` | an identical call is re-issued right after it failed | change the input before retrying |
 | `large-output` | a single tool result ≥ 30 000 chars | pipe through `head` / `grep`, use `limit` |
 | `error-prone` | a tool fails ≥25 % of the time in a session (≥5 calls) | permission rule, missing binary, wrong cwd |
@@ -132,6 +115,14 @@ Thresholds live in `src/analyze.js`; `--large` overrides the output threshold fr
 - [ ] export hints as a ready-to-paste `CLAUDE.md` block
 - [ ] subagent / Task breakdown
 - [ ] HTML report
+
+## Development
+
+```bash
+npm test              # node:test, no extra deps
+npm run demo          # synthetic data + summary
+npm run demo:gif      # re-render assets/demo.gif (needs vhs)
+```
 
 Contributions welcome. Run `npm test` before opening a PR.
 

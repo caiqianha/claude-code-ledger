@@ -18,11 +18,11 @@ async function load() {
 
 test("streaming-split messages are counted once", async () => {
   const { model, report } = await load();
-  assert.equal(model.messages.size, 7);
-  assert.equal(report.totals.messages, 7);
+  assert.equal(model.messages.size, 8);
+  assert.equal(report.totals.messages, 8);
   // msg_1 usage counted once: input 10, not 20
   const t = report.totals;
-  assert.equal(t.input, 10 + 5 * 6);
+  assert.equal(t.input, 10 + 5 * 7);
   assert.equal(t.cacheWrite, 2000);
 });
 
@@ -35,7 +35,7 @@ test("tool calls joined with results and errors", async () => {
   const { report } = await load();
   const bash = report.byTool.find((t) => t.key === "Bash");
   const read = report.byTool.find((t) => t.key === "Read");
-  assert.equal(read.calls, 3);
+  assert.equal(read.calls, 4);
   assert.equal(bash.calls, 3);
   assert.equal(bash.errors, 1);
   assert.equal(bash.maxResultChars, 40_000);
@@ -48,7 +48,7 @@ test("waste detectors fire", async () => {
   assert.ok(kinds.includes("retry"), "retry");
   assert.ok(kinds.includes("large-output"), "large-output");
   const rep = report.waste.find((f) => f.kind === "repeat");
-  assert.equal(rep.count, 3);
+  assert.equal(rep.count, 4);
   assert.equal(rep.tool, "Read");
 });
 

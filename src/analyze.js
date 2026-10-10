@@ -60,7 +60,7 @@ export function analyze(model, opts) {
   const until = opts.until ?? Infinity;
   const projFilter = opts.project ? opts.project.toLowerCase() : null;
   const largeOutput = opts.largeOutput ?? 30_000;
-  const repeatMin = opts.repeatMin ?? 3;
+  const repeatMin = opts.repeatMin ?? 4;
 
   const sessionOk = (s) =>
     !projFilter ||
@@ -185,7 +185,7 @@ export function detectWaste(calls, bySession, { largeOutput, repeatMin }) {
     const chars = list.reduce((n, x) => n + (x.result?.chars || 0), 0);
     findings.push({
       kind: "repeat",
-      severity: list.length >= repeatMin + 2 ? "high" : "medium",
+      severity: list.length >= repeatMin + 3 ? "high" : "medium",
       sessionId: c.sessionId,
       project: c.project,
       tool: c.name,

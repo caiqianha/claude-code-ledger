@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import os from "node:os";
 import { createRequire } from "node:module";
 import { defaultDir, listSessionFiles, iterRecords } from "./loader.js";
 import { buildModel } from "./parse.js";
@@ -25,9 +26,11 @@ Options
   --since <v>      7d | 24h | today | yesterday | YYYY-MM-DD   (default: all)
   --until <v>      YYYY-MM-DD (inclusive)
   --project <s>    Substring match on project name / path
-  --dir <path>     Log directory (default: ~/.claude/projects)
+  --dir <path>     Log directory (default: $CCLEDGER_DIR or ~/.claude/projects)
   --top <n>        Rows to show in ranked tables (default: 15)
   --large <chars>  "Large output" threshold in characters (default: 30000)
+  --kind <k>       waste only: repeat | retry | large-output | error-prone | cold-cache
+                   (without --kind, findings are interleaved across kinds)
   --pricing <f>    Alternate pricing.json
   --json           Print the aggregate as JSON instead of tables
   -h, --help       Show this help
@@ -48,6 +51,7 @@ export async function main(argv) {
       dir: { type: "string" },
       top: { type: "string", default: "15" },
       large: { type: "string" },
+      kind: { type: "string" },
       pricing: { type: "string" },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -58,7 +62,7 @@ export async function main(argv) {
   if (o.version) return console.log(version);
 
   const cmd = positionals[0] || "summary";
-  const dir = o.dir || defaultDir();
+  const dir = o.dir || process.env.CCLEDGER_DIR || defaultDir();
   const files = listSessionFiles(dir);
   if (!files.length) {
     console.error(`No session logs found under ${dir}`);
@@ -101,6 +105,8 @@ export async function main(argv) {
       out.push(renderTools(report, top));
       break;
     case "waste":
+      if (o.kind) report.waste = report.waste.filter((f) => f.kind === o.kind);
+      else report.waste = interleaveByKind(report.waste, report.waste.length);
       out.push(renderWaste(report, top));
       break;
     case "models":
@@ -182,7 +188,7 @@ function renderSummary(r, top) {
   parts.push(heading("Top tools"));
   parts.push(toolTable(r.byTool.slice(0, Math.min(top, 8))));
   parts.push(heading("Top waste"));
-  parts.push(r.waste.length ? wasteTable(r.waste.slice(0, Math.min(top, 8))) : "nothing flagged");
+  parts.push(r.waste.length ? wasteTable(interleaveByKind(r.waste, Math.min(top, 8))) : "nothing flagged");
   parts.push("\nRun `ccledger waste`, `ccledger sessions` or `ccledger tools` for the full lists.");
   return parts.join("\n");
 }
@@ -242,6 +248,21 @@ function renderTools(r, top) {
   return heading("Tools") + "\n" + toolTable(r.byTool.slice(0, top));
 }
 
+/** Round-robin across finding kinds so the summary shows variety, not eight of the same. */
+function interleaveByKind(findings, n) {
+  const buckets = new Map();
+  for (const f of findings) (buckets.get(f.kind) || buckets.set(f.kind, []).get(f.kind)).push(f);
+  const out = [];
+  while (out.length < n) {
+    let took = false;
+    for (const b of buckets.values()) {
+      if (b.length && out.length < n) { out.push(b.shift()); took = true; }
+    }
+    if (!took) break;
+  }
+  return out;
+}
+
 function wasteTable(rows) {
   return table(rows, [
     { key: "severity", label: "sev" },
@@ -279,5 +300,5 @@ function footer(r) {
   const range = [r.range.since ? `since ${new Date(r.range.since).toLocaleDateString("sv-SE")}` : "all time", r.range.project ? `project~"${r.range.project}"` : null]
     .filter(Boolean)
     .join(", ");
-  return `\n${m.files} files · ${fmtNum(m.lines)} lines · ${range} · parsed in ${m.parseMs}ms · ${m.dir}`;
+  return `\n${m.files} files · ${fmtNum(m.lines)} lines · ${range} · parsed in ${m.parseMs}ms · ${m.dir.replace(os.homedir(), "~")}`;
 }
