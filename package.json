@@ -12,5 +12,5 @@
   "engines": { "node": ">=18" },
   "keywords": ["claude-code", "claude", "anthropic", "token", "cost", "usage", "audit", "tool-calls", "cli"],
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/CHANGE_ME/claude-code-ledger" }
+  "repository": { "type": "git", "url": "https://github.com/caiqianha/claude-code-ledger" }
 }
