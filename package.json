@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "start": "node bin/ccledger.js",
-    "test": "node --test test/",
+    "test": "node --test test/analyze.test.js test/features.test.js",
     "demo": "node scripts/demo-data.mjs /tmp/ccledger-demo && CCLEDGER_DIR=/tmp/ccledger-demo node bin/ccledger.js",
     "demo:gif": "node scripts/demo-data.mjs /tmp/ccledger-demo && node scripts/render-gif.mjs",
     "demo:pages": "node scripts/demo-data.mjs /tmp/ccledger-demo && node bin/ccledger.js report --dir /tmp/ccledger-demo --out docs/index.html"
