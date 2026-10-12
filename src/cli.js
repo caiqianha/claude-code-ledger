@@ -11,6 +11,7 @@ import { advise } from "./advise.js";
 import { mergeReports } from "./merge.js";
 import { renderHtml } from "./report.js";
 import { watch } from "./watch.js";
+import { statusline } from "./statusline.js";
 import { table, heading, kv, fmtNum, fmtUsd, fmtPct, fmtDur, fmtMs, fmtDate, short, truncate, setColor, c, sev } from "./render.js";
 
 const { version } = createRequire(import.meta.url)("../package.json");
@@ -34,6 +35,7 @@ Reports
 Live & integration
   watch            Live view of the current session (--session <id-prefix>)
   hook             One-line session summary for a Claude Code Stop hook (reads hook JSON on stdin)
+  statusline       Status bar line for Claude Code's statusLine setting (cost · context · tools · top flag)
   merge <a.json..> Combine several --json exports (e.g. a team) into one report
 
 Pricing
@@ -48,7 +50,8 @@ Options
   --top <n>        Rows to show in ranked tables (default: 15)
   --large <chars>  "Large output" threshold in characters (default: 30000)
   --kind <k>       waste only: repeat | retry | large-output | error-prone | cold-cache
-  --session <s>    watch / hook: session id prefix
+  --session <s>    watch / hook / statusline: session id prefix
+  --no-cache       statusline: re-parse the transcript instead of using the incremental cache
   --out <file>     report: output path (default: ccledger-report.html)
   --pricing <f>    Alternate pricing.json
   --json           Print the aggregate as JSON instead of tables
@@ -78,6 +81,7 @@ export async function main(argv, io = { stdout: process.stdout, stderr: process.
       json: { type: "boolean", default: false },
       write: { type: "boolean", default: false },
       once: { type: "boolean", default: false },
+      "no-cache": { type: "boolean", default: false },
       "no-color": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
@@ -107,6 +111,10 @@ export async function main(argv, io = { stdout: process.stdout, stderr: process.
   }
   if (cmd === "watch") {
     return watch({ dir: dirs[0], session: o.session, pricing, out: io.stdout, once: o.once });
+  }
+  if (cmd === "statusline") {
+    setColor(!o["no-color"] && !process.env.NO_COLOR); // stdout is a pipe here, but Claude Code renders ANSI
+    return statusline({ dirs, pricing, session: o.session, io, noCache: o["no-cache"] });
   }
   if (cmd === "hook") {
     return hook({ dirs, pricing, session: o.session, io, print });

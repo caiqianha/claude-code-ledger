@@ -1,6 +1,6 @@
 {
   "name": "claude-code-ledger",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Local-first cost & tool-call audit for Claude Code: per-tool context cost, waste detection, CLAUDE.md advice, live watch, HTML report. Never reads your message content.",
   "type": "module",
   "bin": {
@@ -18,7 +18,8 @@
     "start": "node bin/ccledger.js",
     "test": "node --test test/",
     "demo": "node scripts/demo-data.mjs /tmp/ccledger-demo && CCLEDGER_DIR=/tmp/ccledger-demo node bin/ccledger.js",
-    "demo:gif": "node scripts/demo-data.mjs /tmp/ccledger-demo && node scripts/render-gif.mjs"
+    "demo:gif": "node scripts/demo-data.mjs /tmp/ccledger-demo && node scripts/render-gif.mjs",
+    "demo:pages": "node scripts/demo-data.mjs /tmp/ccledger-demo && node bin/ccledger.js report --dir /tmp/ccledger-demo --out docs/index.html"
   },
   "engines": {
     "node": ">=18"

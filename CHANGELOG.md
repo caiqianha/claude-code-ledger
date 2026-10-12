@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 - 2026-10-12
+
+- `statusline`: one-line status for Claude Code's `statusLine` setting (cost and context from Claude Code, tool calls, cache hit and top waste flag from the transcript), with an incremental byte-offset cache so each refresh only parses new lines.
+- Live demo HTML report published at https://caiqianha.github.io/claude-code-ledger/ (synthetic data).
+- GitHub Actions CI on Node 18 / 20 / 22.
+- README: fixed a broken build that had duplicated the file four times.
+
 ## 0.2.0 — 2026-10-10
 
 - **context cost attribution**: every tool result is priced by how long it stayed in context; new `context` command, `context $` column in `tools`, `~$` on waste findings

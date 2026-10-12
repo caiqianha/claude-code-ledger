@@ -62,3 +62,35 @@ export async function* iterRecords(files) {
     }
   }
 }
+
+/**
+ * Read complete JSONL records from `file` starting at byte `offset`.
+ * Returns the parsed records and the offset just past the last full line,
+ * so callers can resume later without re-reading the file.
+ */
+export function readRecordsFrom(file, offset = 0, meta = {}) {
+  const size = fs.statSync(file).size;
+  if (size < offset) offset = 0; // file was truncated / rotated
+  if (size === offset) return { records: [], offset };
+  const fd = fs.openSync(file, "r");
+  const buf = Buffer.alloc(size - offset);
+  fs.readSync(fd, buf, 0, buf.length, offset);
+  fs.closeSync(fd);
+  const end = buf.lastIndexOf(0x0a);
+  if (end === -1) return { records: [], offset }; // only a partial line so far
+  const text = buf.subarray(0, end).toString("utf8");
+  const records = [];
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    try {
+      const rec = JSON.parse(line);
+      rec._projectDir = meta.projectDir ?? path.basename(path.dirname(file));
+      rec._fileSession = path.basename(file, ".jsonl");
+      rec._file = file;
+      records.push(rec);
+    } catch {
+      /* skip malformed */
+    }
+  }
+  return { records, offset: offset + end + 1 };
+}

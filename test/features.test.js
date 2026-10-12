@@ -115,3 +115,31 @@ test("cli: report writes an html file", async () => {
   assert.ok(fs.statSync(out).size > 5000);
   fs.unlinkSync(out);
 });
+
+test("cli: statusline from stdin json and from --session", async () => {
+  const chunks = [];
+  const transcript = path.join(fixtures, "-Users-demo-code-demo-app", "11111111-2222-3333-4444-555555555555.jsonl");
+  const payload = {
+    session_id: "11111111-2222-3333-4444-555555555555",
+    transcript_path: transcript,
+    model: { id: "claude-opus-5-5", display_name: "Opus" },
+    cost: { total_cost_usd: 1.5 },
+    context_window: { context_window_size: 200000, current_usage: { input_tokens: 1000, cache_creation_input_tokens: 0, cache_read_input_tokens: 59000 } },
+  };
+  const stdin = Object.assign((async function* () { yield JSON.stringify(payload); })(), { isTTY: false });
+  const io = { stdout: { write: (s) => chunks.push(s), isTTY: false }, stderr: process.stderr, stdin };
+  process.env.NO_COLOR = "1";
+  await main(["statusline", "--no-cache"], io);
+  const line = chunks.join("");
+  assert.match(line, /^Opus · \$1\.50 · ctx 60\.0k 30% · \d+ calls/);
+  assert.match(line, /⚠ (repeat|cold-cache)/);
+  chunks.length = 0;
+  // second run uses the incremental cache and must give the same tool counts
+  const io2 = { stdout: { write: (s) => chunks.push(s), isTTY: false }, stderr: process.stderr, stdin: { isTTY: true } };
+  await main(["statusline", "--dir", fixtures, "--session", "11111111"], io2);
+  await main(["statusline", "--dir", fixtures, "--session", "11111111"], io2);
+  const [a, b] = chunks;
+  assert.equal(a, b);
+  assert.match(a, /calls/);
+  delete process.env.NO_COLOR;
+});
