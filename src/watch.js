@@ -73,7 +73,7 @@ export async function watch({ dir, session, pricing, interval = 1000, out = proc
       return { time: fmtTime(call.ts), tool: call.name, preview: call.preview, chars: res ? res.chars : null, ms: res && res.ts !== null && call.ts !== null ? res.ts - call.ts : null, status: !res ? c.dim("…") : res.isError ? c.red("error") : c.green("ok") };
     });
     const parts = [];
-    parts.push(c.bold(`ccledger watch`) + c.dim(`  ${s ? s.project : "-"} · ${short(entry.file.split("/").pop())} · ${last ? last.model : "-"} · ${fmtTime(Date.now())}`));
+    parts.push(c.bold(`ccledger watch`) + c.dim(`  ${s ? s.project : "-"} · ${short(path.basename(entry.file))} · ${last ? last.model : "-"} · ${fmtTime(Date.now())}`));
     if (ss) {
       parts.push(
         kv([

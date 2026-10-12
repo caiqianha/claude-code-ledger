@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Claude Code docs (statusline, hooks)
+    url: https://docs.claude.com/en/docs/claude-code
+    about: Setting-level questions about Claude Code itself

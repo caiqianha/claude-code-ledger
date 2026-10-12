@@ -178,6 +178,8 @@ npm run demo          # synthetic data + summary
 npm run demo:gif      # re-render assets/demo.gif (needs vhs)
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR.
+
 Contributions welcome. Run `npm test` before opening a PR.
 ## 中文说明
 

@@ -1,0 +1,32 @@
+name: Bug report
+description: Something is wrong in a command, the statusline or the HTML report
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not attach Claude Code transcripts. They contain your conversation. Describe the line shape instead.
+  - type: input
+    id: version
+    attributes:
+      label: ccledger version and Node version
+      placeholder: "ccledger 0.3.0, node 20.17.0, macOS 15"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command you ran
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected and what happened instead
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else (error output, size of your projects dir, number of sessions)

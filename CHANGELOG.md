@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `watch`: session file name is derived with `path.basename`, so Windows paths no longer show the full path.
+- CONTRIBUTING guide and issue templates.
+
 ## 0.3.0 - 2026-10-12
 
 - `statusline`: one-line status for Claude Code's `statusLine` setting (cost and context from Claude Code, tool calls, cache hit and top waste flag from the transcript), with an incremental byte-offset cache so each refresh only parses new lines.

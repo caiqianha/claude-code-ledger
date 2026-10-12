@@ -1,0 +1,21 @@
+name: Feature request
+description: A new detector, column, command or integration
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to find out about your Claude Code usage?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed command or output (sketch the table or line)
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: This can be computed without reading message content
+          required: true
