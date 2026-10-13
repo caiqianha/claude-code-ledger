@@ -28,3 +28,5 @@ Detectors live in `src/analyze.js` and return `{ kind, tool, detail, count, cost
 ## Reporting a problem
 
 Open an issue with the output of `ccledger --version`, your Node version, and the command you ran. Do not attach transcripts; if a specific line shape breaks the parser, describe the keys and types instead.
+
+By participating you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).
