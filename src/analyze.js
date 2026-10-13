@@ -20,19 +20,29 @@ export function newStat() {
   };
 }
 
-function addUsage(st, u, cost, sidechain) {
+function addUsage(st, u, cost, sidechain, flags = NOFLAGS) {
   st.messages++;
   st.input += u.input;
   st.output += u.output;
   st.cacheRead += u.cacheRead;
   st.cacheWrite += u.cacheWrite5m + u.cacheWrite1h;
   st.thinking += u.thinking;
+  if (flags.estimated) st.estimated = true; // some tokens were estimated from text length
+  if (flags.noPricing) {
+    // Agents without per-token billing (Cursor): tokens only. Flag the row as unpriced
+    // unless something priced also contributed; never mark it as an unknown model.
+    if (!st._priced) st.noPricing = true;
+    return;
+  }
+  if (!st._priced) Object.defineProperty(st, "_priced", { value: true, enumerable: false, writable: true, configurable: true });
+  if (st.noPricing) delete st.noPricing;
   if (cost === null) st.unknownModel = true;
   else {
     st.est += cost;
     if (sidechain) st.sub += cost;
   }
 }
+const NOFLAGS = {};
 
 export function totalTokens(st) {
   return st.input + st.output + st.cacheRead + st.cacheWrite;
@@ -101,6 +111,7 @@ export function analyze(model, opts) {
   const byModel = new Map();
   const bySession = new Map();
   const byTool = new Map();
+  const byAgent = new Map();
   const sessionDayEst = new Map(); // sid -> Map(day -> est), for apportioning reported cost
   const sessionMsgTs = new Map(); // sid -> sorted message timestamps (all, unfiltered) for attribution
   const sessionModelEst = new Map(); // sid -> Map(model -> est), to find each session's primary model
@@ -114,17 +125,19 @@ export function analyze(model, opts) {
   for (const msg of model.messages.values()) {
     const s = model.sessions.get(msg.sessionId);
     if (!s || !sessionOk(s) || !tsOk(msg.ts)) continue;
-    const cost = costOf(msg.usage, resolvePrice(pricing, msg.model));
-    addUsage(totals, msg.usage, cost, msg.sidechain);
+    const flags = s.noPricing || msg.estimated ? { noPricing: !!s.noPricing, estimated: !!msg.estimated } : NOFLAGS;
+    const cost = s.noPricing ? null : costOf(msg.usage, resolvePrice(pricing, msg.model));
+    addUsage(totals, msg.usage, cost, msg.sidechain, flags);
     if (msg.ts !== null) {
       const day = localDay(msg.ts);
-      addUsage(bump(byDay, day, newStat), msg.usage, cost, msg.sidechain);
+      addUsage(bump(byDay, day, newStat), msg.usage, cost, msg.sidechain, flags);
       const sd = bump(sessionDayEst, s.id, () => new Map());
       sd.set(day, (sd.get(day) || 0) + (cost || 0));
     }
-    addUsage(bump(byProject, s.project, newStat), msg.usage, cost, msg.sidechain);
-    addUsage(bump(byModel, msg.model, newStat), msg.usage, cost, msg.sidechain);
-    addUsage(bump(bySession, s.id, () => ({ ...newStat(), session: s })), msg.usage, cost, msg.sidechain);
+    addUsage(bump(byProject, s.project, newStat), msg.usage, cost, msg.sidechain, flags);
+    addUsage(bump(byModel, msg.model, newStat), msg.usage, cost, msg.sidechain, flags);
+    addUsage(bump(bySession, s.id, () => ({ ...newStat(), session: s })), msg.usage, cost, msg.sidechain, flags);
+    addUsage(bump(byAgent, s.agent || "claude", newStat), msg.usage, cost, msg.sidechain, flags);
     const sm = bump(sessionModelEst, s.id, () => new Map());
     sm.set(msg.model, (sm.get(msg.model) || 0) + (cost || 0));
   }
@@ -173,6 +186,7 @@ export function analyze(model, opts) {
     if (call.ts !== null) bumpStat(bump(byDay, localDay(call.ts), newStat));
     bumpStat(bump(byProject, s.project, newStat));
     bumpStat(bump(bySession, s.id, () => ({ ...newStat(), session: s })));
+    bumpStat(bump(byAgent, s.agent || "claude", newStat));
   }
 
   // ---- reported cost (Claude Code cost-state, cumulative per session), apportioned to days by est share ----
@@ -212,7 +226,7 @@ export function analyze(model, opts) {
 
   const waste = detectWaste(calls, bySession, { largeOutput, repeatMin });
 
-  return {
+  const report = {
     range: { since: opts.since ?? null, until: opts.until ?? null, project: opts.project ?? null },
     totals,
     reported: { usd: reported, sessions: reportedSessions, of: bySession.size },
@@ -225,7 +239,45 @@ export function analyze(model, opts) {
     waste,
     sessionsIncluded: bySession.size,
     calibration: calibrate(model, bySession),
+    byAgent: sortBy(byAgent, (v) => -v.est),
   };
+  // Pattern counters feed `advise --claude-md` and `compare`. Kept off the JSON export (non-enumerable)
+  // so existing exports stay unchanged; merge.js ignores them.
+  Object.defineProperty(report, "patterns", { value: patternStats(calls, waste, bySession), enumerable: false });
+  return report;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pattern counters (rates behind the CLAUDE.md suggestions)            */
+/* ------------------------------------------------------------------ */
+
+const FILE_READ = new Set(["Read", "read_file", "read_file_v2", "read_many_files", "read_lints"]);
+const SEARCH = new Set(["Glob", "Grep", "glob", "search_file_content", "grep_search", "grep_search_v2", "ripgrep_raw_search", "glob_file_search", "codebase_search", "list_dir", "list_directory", "list_dir_v2", "grep_files"]);
+
+export function patternStats(calls, waste, bySession) {
+  const seen = new Set();
+  const p = { toolCalls: calls.length, reads: 0, rereads: 0, searches: 0, researches: 0, shell: 0, reshell: 0, retries: 0, largeOutputs: 0, largeChars: 0, largeUsd: 0, largeByTool: {}, errors: 0, coldSessions: 0, sessions: bySession.size, wastedCalls: 0, wastedUsd: 0, rereadUsd: 0 };
+  const sorted = calls.slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  for (const c of sorted) {
+    if (c.result?.isError) p.errors++;
+    if (!isReadLike(c.name)) continue;
+    const k = `${c.sessionId}\u0000${c.epoch}\u0000${c.key}`;
+    const again = seen.has(k);
+    seen.add(k);
+    const isFile = FILE_READ.has(c.name);
+    const isSearch = SEARCH.has(c.name);
+    const isShell = !isFile && !isSearch && !c.name.startsWith("mcp__") && !/^Web/.test(c.name);
+    if (isFile) { p.reads++; if (again) { p.rereads++; p.rereadUsd += c.ctxCost; } }
+    else if (isSearch) { p.searches++; if (again) p.researches++; }
+    else if (isShell) { p.shell++; if (again) p.reshell++; }
+    if (again) { p.wastedCalls++; p.wastedUsd += c.ctxCost; }
+  }
+  for (const f of waste) {
+    if (f.kind === "retry") { p.retries += f.count; p.wastedCalls += f.count; p.wastedUsd += f.usd || 0; }
+    else if (f.kind === "large-output") { p.largeOutputs++; p.largeChars = Math.max(p.largeChars, f.chars); p.largeUsd += f.usd || 0; p.largeByTool[f.tool] = (p.largeByTool[f.tool] || 0) + 1; p.wastedCalls++; p.wastedUsd += f.usd || 0; }
+    else if (f.kind === "cold-cache") p.coldSessions++;
+  }
+  return p;
 }
 
 /**

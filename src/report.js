@@ -63,15 +63,18 @@ export function renderHtml(r, { title = "ccledger report" } = {}) {
     { key: "cacheRead", label: "cache rd", align: "r", fmt: fmtNum },
     { key: "cacheWrite", label: "cache wr", align: "r", fmt: fmtNum },
     { key: "_hit", label: "hit", align: "r", fmt: (_, row) => fmtPct(cacheHitRate(row)) },
-    { key: "est", label: "est $", align: "r", fmt: (v, row) => fmtUsd(v, row.unknownModel) },
+    { key: "est", label: "est $", align: "r", fmt: (v, row) => (row.noPricing ? "n/a" : fmtUsd(v, row.unknownModel)) },
   ];
+  const multiAgent = (r.byAgent || []).length > 1 || (r.byAgent || []).some((a) => a.key !== "claude");
+  const estFmt = (v, row) => (row.noPricing ? "n/a" : fmtUsd(v, row.unknownModel));
   const sections = [
+    ...(multiAgent ? [["By agent", htmlTable(r.byAgent, [{ key: "key", label: "agent" }, { key: "messages", label: "msgs", align: "r", fmt: fmtNum }, ...tokenCols, { key: "toolCalls", label: "tools", align: "r" }, { key: "toolErrors", label: "errs", align: "r" }])]] : []),
     ["Daily", dailyChart(r.byDay) + htmlTable(r.byDay, [{ key: "key", label: "day" }, { key: "messages", label: "msgs", align: "r", fmt: fmtNum }, ...tokenCols, { key: "reported", label: "reported $", align: "r", fmt: (v) => (v == null ? "-" : fmtUsd(v)) }, { key: "toolCalls", label: "tools", align: "r" }])],
     ["By model", htmlTable(r.byModel, [{ key: "key", label: "model" }, { key: "messages", label: "msgs", align: "r", fmt: fmtNum }, ...tokenCols])],
     ["By project", htmlTable(r.byProject, [{ key: "key", label: "project" }, { key: "messages", label: "msgs", align: "r", fmt: fmtNum }, ...tokenCols, { key: "toolCalls", label: "tools", align: "r" }])],
     ["Tools", htmlTable(r.byTool, [{ key: "key", label: "tool" }, { key: "calls", label: "calls", align: "r" }, { key: "errors", label: "errs", align: "r" }, { key: "resultChars", label: "out chars", align: "r", fmt: fmtNum }, { key: "maxResultChars", label: "max", align: "r", fmt: fmtNum }, { key: "ctxCost", label: "context $", align: "r", fmt: (v) => fmtUsd(v) }])],
     ["Most expensive context", htmlTable(r.byContext.slice(0, 25), [{ key: "tool", label: "tool" }, { key: "preview", label: "input" }, { key: "calls", label: "calls", align: "r" }, { key: "sessions", label: "sessions", align: "r" }, { key: "chars", label: "chars", align: "r", fmt: fmtNum }, { key: "ctxCost", label: "context $", align: "r", fmt: (v) => fmtUsd(v) }])],
-    ["Sessions", htmlTable(r.bySession.slice(0, 40), [{ key: "key", label: "session", fmt: (v) => short(v) }, { key: "session", label: "started", fmt: (s) => fmtDate(s.firstTs) }, { key: "session", label: "project", fmt: (s) => s.project }, { key: "session", label: "wall", align: "r", fmt: (s) => fmtDur(s.lastTs - s.firstTs) }, { key: "session", label: "turns", align: "r", fmt: (s) => s.humanTurns }, { key: "_tok", label: "tokens", align: "r", fmt: (_, row) => fmtNum(totalTokens(row)) }, { key: "_hit", label: "hit", align: "r", fmt: (_, row) => fmtPct(cacheHitRate(row)) }, { key: "toolCalls", label: "tools", align: "r" }, { key: "est", label: "est $", align: "r", fmt: (v, row) => fmtUsd(v, row.unknownModel) }, { key: "reported", label: "reported $", align: "r", fmt: (v) => (v == null ? "-" : fmtUsd(v)) }])],
+    ["Sessions", htmlTable(r.bySession.slice(0, 40), [{ key: "key", label: "session", fmt: (v) => short(v) }, ...(multiAgent ? [{ key: "session", label: "agent", fmt: (s) => s.agent || "claude" }] : []), { key: "session", label: "started", fmt: (s) => fmtDate(s.firstTs) }, { key: "session", label: "project", fmt: (s) => s.project }, { key: "session", label: "wall", align: "r", fmt: (s) => fmtDur(s.lastTs - s.firstTs) }, { key: "session", label: "turns", align: "r", fmt: (s) => s.humanTurns }, { key: "_tok", label: "tokens", align: "r", fmt: (_, row) => (row.estimated ? "~" : "") + fmtNum(totalTokens(row)) }, { key: "_hit", label: "hit", align: "r", fmt: (_, row) => fmtPct(cacheHitRate(row)) }, { key: "toolCalls", label: "tools", align: "r" }, { key: "est", label: "est $", align: "r", fmt: estFmt }, { key: "reported", label: "reported $", align: "r", fmt: (v) => (v == null ? "-" : fmtUsd(v)) }])],
     ["Waste", htmlTable(r.waste.slice(0, 60), [{ key: "severity", label: "sev" }, { key: "kind", label: "kind" }, { key: "tool", label: "tool" }, { key: "count", label: "n", align: "r" }, { key: "chars", label: "chars", align: "r", fmt: fmtNum }, { key: "usd", label: "~$", align: "r", fmt: (v) => fmtUsd(v || 0) }, { key: "project", label: "project" }, { key: "sessionId", label: "session", fmt: (v) => short(v) }, { key: "detail", label: "detail" }])],
   ]
     .map(([h, body]) => `<section><h2>${esc(h)}</h2>${body}</section>`)
@@ -95,6 +98,6 @@ footer{color:var(--fg2);font-size:12px;margin-top:32px}
 <div class="meta">${esc(range)} · ${r.meta ? `${r.meta.files} files · ${fmtNum(r.meta.lines)} lines` : ""} · generated ${esc(new Date().toISOString().slice(0, 16).replace("T", " "))}</div>
 <div class="tiles">${tiles}</div>
 ${sections}
-<footer>Estimated costs use list prices per model; "reported" is Claude Code's own cost-state. Context cost ≈ tokens of a tool result × (one cache write + one cache read per later message until compaction). Generated by ccledger; no message content is included.</footer>
+<footer>Estimated costs use list prices per model; "reported" is Claude Code's own cost-state. "~" marks token counts estimated from text length; "n/a" marks agents without per-token billing (Cursor). Context cost ≈ tokens of a tool result × (one cache write + one cache read per later message until compaction). Generated by ccledger; no message content is included.</footer>
 </main></body></html>`;
 }

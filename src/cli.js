@@ -4,19 +4,23 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { defaultDir, listSessionFiles, iterRecords } from "./loader.js";
-import { buildModel } from "./parse.js";
+import { buildModel, ingestTurns } from "./parse.js";
+import { AGENTS, resolveAgents, locate, readAll } from "./agents/index.js";
 import { loadPricing, updatePricing, writeCalibrated, userPricingPath } from "./pricing.js";
 import { analyze, totalTokens, cacheHitRate } from "./analyze.js";
-import { advise } from "./advise.js";
+import { advise, claudeMdBlock } from "./advise.js";
 import { mergeReports } from "./merge.js";
 import { renderHtml } from "./report.js";
 import { watch } from "./watch.js";
 import { statusline } from "./statusline.js";
+import { loadConfig, configPath, addMarker, findMarker, statePath } from "./config.js";
+import { parseBudget, formatBudget } from "./budget.js";
+import { compare, windows, renderCompare } from "./compare.js";
 import { table, heading, kv, fmtNum, fmtUsd, fmtPct, fmtDur, fmtMs, fmtDate, short, truncate, setColor, c, sev } from "./render.js";
 
 const { version } = createRequire(import.meta.url)("../package.json");
 
-const HELP = `ccledger ${version} — local-first cost & tool-call audit for Claude Code
+const HELP = `ccledger ${version} — local-first cost & tool-call audit for Claude Code (and Codex / Gemini CLI / Cursor logs)
 
 Usage: ccledger [command] [options]
 
@@ -29,13 +33,15 @@ Reports
   context          Most expensive tool results by file / command / query
   waste            Wasteful call patterns with hints
   models           Token split per model
-  advise           Paste-ready CLAUDE.md block built from the findings
+  today            Today's spend, tokens and waste; shows the daily budget when one is set
+  compare          Before/after table: waste rate, tokens & cost per session, cache hit, verdict
+  advise           Paste-ready CLAUDE.md block built from the findings (--claude-md for rules + evidence)
   report           Single-file HTML report (--out report.html)
 
 Live & integration
   watch            Live view of the current session (--session <id-prefix>)
   hook             One-line session summary for a Claude Code Stop hook (reads hook JSON on stdin)
-  statusline       Status bar line for Claude Code's statusLine setting (cost · context · tools · top flag)
+  statusline       Status bar line for Claude Code's statusLine setting (cost · budget · context · tools · top flag)
   merge <a.json..> Combine several --json exports (e.g. a team) into one report
 
 Pricing
@@ -43,16 +49,26 @@ Pricing
   update-pricing   Download the latest pricing table into ${userPricingPath()}
 
 Options
-  --since <v>      7d | 24h | today | yesterday | YYYY-MM-DD   (default: all)
+  --agent <a>      claude (default) | codex | gemini | cursor | all | comma list. Log locations:
+${Object.values(AGENTS).map((a) => `                   ${a.name.padEnd(8)} ${a.location}`).join("\n")}
+                   codex: tokens from token_count events; gemini: tokens recorded per message, else
+                   estimated (~); cursor: best effort via the sqlite3 CLI, tokens mostly estimated, no cost.
+  --since <v>      7d | 24h | today | yesterday | YYYY-MM-DD   (default: all; compare: 7d)
   --until <v>      YYYY-MM-DD (inclusive)
   --project <s>    Substring match on project name / path
-  --dir <path>     Log directory, repeatable (default: $CCLEDGER_DIR or ~/.claude/projects)
+  --dir <path>     Log directory, repeatable (default: $CCLEDGER_DIR or ~/.claude/projects; with a single
+                   --agent it points at that agent's directory, e.g. ~/.codex/sessions)
   --top <n>        Rows to show in ranked tables (default: 15)
   --large <chars>  "Large output" threshold in characters (default: 30000)
   --kind <k>       waste only: repeat | retry | large-output | error-prone | cold-cache
+  --budget <usd>   Daily budget for statusline / today (or "budget" in ${configPath()});
+                   yellow ⚠ from 80%, red "⚠ over" from 100%
+  --claude-md      advise: emit suggested rules with the evidence that triggered each one
+  --baseline <v>   compare: baseline window, "30d" or "20 sessions" (default: same length as --since)
+  --mark [label]   compare: with a label, store a marker now; without one, compare before/after the last marker
   --session <s>    watch / hook / statusline: session id prefix
   --no-cache       statusline: re-parse the transcript instead of using the incremental cache
-  --out <file>     report: output path (default: ccledger-report.html)
+  --out <file>     report / advise --claude-md: output path (default: ccledger-report.html / stdout)
   --pricing <f>    Alternate pricing.json
   --json           Print the aggregate as JSON instead of tables
   --no-color       Disable ANSI colors (also honours NO_COLOR)
@@ -64,6 +80,8 @@ output sizes are read. Message text is never loaded into the report.
 `;
 
 export async function main(argv, io = { stdout: process.stdout, stderr: process.stderr, stdin: process.stdin }) {
+  // `--mark` may be used without a value ("compare before/after the last marker").
+  argv = argv.flatMap((a, i, arr) => (a === "--mark" && (i + 1 >= arr.length || arr[i + 1].startsWith("-")) ? ["--mark="] : [a]));
   const { values: o, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
@@ -72,12 +90,17 @@ export async function main(argv, io = { stdout: process.stdout, stderr: process.
       until: { type: "string" },
       project: { type: "string" },
       dir: { type: "string", multiple: true },
+      agent: { type: "string" },
       top: { type: "string", default: "15" },
       large: { type: "string" },
       kind: { type: "string" },
       session: { type: "string" },
       out: { type: "string" },
       pricing: { type: "string" },
+      budget: { type: "string" },
+      baseline: { type: "string" },
+      mark: { type: "string" },
+      "claude-md": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       write: { type: "boolean", default: false },
       once: { type: "boolean", default: false },
@@ -92,10 +115,15 @@ export async function main(argv, io = { stdout: process.stdout, stderr: process.
   if (o.version) return print(version);
   setColor(!o["no-color"] && !process.env.NO_COLOR && io.stdout.isTTY && !o.json);
 
+  const cfg = loadConfig();
   const cmd = positionals[0] || "summary";
   const dirs = o.dir?.length ? o.dir : [process.env.CCLEDGER_DIR || defaultDir()];
+  const agents = resolveAgents(o.agent || cfg.agent || "claude");
+  const multiAgent = agents.length > 1 || agents[0].name !== "claude";
   const pricing = loadPricing(o.pricing);
   const top = Number(o.top) || 15;
+  const budget = parseBudget(o.budget ?? process.env.CCLEDGER_BUDGET ?? cfg.budget);
+  const largeOutput = o.large ? Number(o.large) : cfg.large ? Number(cfg.large) : undefined;
 
   // ---- commands that do not need the full log scan ----
   if (cmd === "update-pricing") {
@@ -114,29 +142,31 @@ export async function main(argv, io = { stdout: process.stdout, stderr: process.
   }
   if (cmd === "statusline") {
     setColor(!o["no-color"] && !process.env.NO_COLOR); // stdout is a pipe here, but Claude Code renders ANSI
-    return statusline({ dirs, pricing, session: o.session, io, noCache: o["no-cache"] });
+    return statusline({ dirs, pricing, session: o.session, io, noCache: o["no-cache"], budget });
   }
   if (cmd === "hook") {
     return hook({ dirs, pricing, session: o.session, io, print });
   }
 
   // ---- full scan ----
-  const files = dirs.flatMap((d) => listSessionFiles(d));
+  const { sources, notes } = locate(agents, o.dir);
+  for (const n of notes) io.stderr.write(`${n}\n`);
+  const files = sources.flatMap((s) => s.entries);
   if (!files.length) {
-    io.stderr.write(`No session logs found under ${dirs.join(", ")}\n`);
+    io.stderr.write(`No session logs found under ${sources.map((s) => `${s.agent.label}: ${s.dirs.join(", ")}`).join("; ") || agents.map((a) => a.location).join("; ")}\n`);
     process.exitCode = 1;
     return;
   }
   const t0 = Date.now();
-  const model = await buildModel(iterRecords(files));
-  const report = analyze(model, {
-    pricing,
-    since: parseSince(o.since),
-    until: parseUntil(o.until),
-    project: o.project,
-    largeOutput: o.large ? Number(o.large) : undefined,
-  });
-  report.meta = { dir: dirs.join(", "), files: files.length, lines: model.stats.lines, parseMs: Date.now() - t0, pricing: pricing._source };
+  const model = await ingestTurns(readAll(sources));
+
+  if (cmd === "compare") return compareCmd(model, pricing, { o, print, largeOutput });
+
+  const since = cmd === "today" ? startOfDay(Date.now()) : parseSince(o.since);
+  const report = analyze(model, { pricing, since, until: parseUntil(o.until), project: o.project, largeOutput });
+  report.meta = { dir: sources.map((s) => s.dirs.join(", ")).join(", "), files: files.length, lines: model.stats.lines, parseMs: Date.now() - t0, pricing: pricing._source };
+  if (multiAgent) report.meta.agents = agents.map((a) => a.name);
+  else delete report.byAgent; // single-agent Claude reports keep their previous shape
 
   if (cmd === "calibrate") return calibrateCmd(report, pricing, { o, print });
   if (cmd === "report") {
@@ -144,11 +174,18 @@ export async function main(argv, io = { stdout: process.stdout, stderr: process.
     fs.writeFileSync(outFile, renderHtml(report, { title: `ccledger · ${report.range.project || "all projects"}` }));
     return print(`Report written to ${path.resolve(outFile)}`);
   }
-  if (cmd === "advise") return print(advise(report, { max: top, days: daysOf(o.since) }));
-  return emit(report, cmd, { o, top, print });
+  if (cmd === "advise") {
+    if (!o["claude-md"]) return print(advise(report, { max: top, days: daysOf(o.since) }));
+    const block = claudeMdBlock(report, { days: daysOf(o.since), large: largeOutput ?? 30_000 });
+    if (!o.out) return print(block);
+    fs.writeFileSync(o.out, block);
+    return print(`Suggestions written to ${path.resolve(o.out)} (${(block.match(/^- /gm) || []).length} rules)`);
+  }
+  if (cmd === "today") return o.json ? emit(report, "summary", { o, top, print }) : print(renderToday(report, { budget, multiAgent }) + footer(report));
+  return emit(report, cmd, { o, top, print, multiAgent });
 }
 
-function emit(report, cmd, { o, top, print }) {
+function emit(report, cmd, { o, top, print, multiAgent = false }) {
   if (o.json) {
     const plain = JSON.parse(JSON.stringify(report, (k, v) => (k === "session" ? sessionBrief(v) : v)));
     return print(JSON.stringify(plain, null, 2));
@@ -156,7 +193,7 @@ function emit(report, cmd, { o, top, print }) {
   const out = [];
   switch (cmd) {
     case "summary":
-      out.push(renderSummary(report, top));
+      out.push(renderSummary(report, top, multiAgent));
       break;
     case "daily":
       out.push(renderDaily(report));
@@ -165,7 +202,7 @@ function emit(report, cmd, { o, top, print }) {
       out.push(renderProjects(report, top));
       break;
     case "sessions":
-      out.push(renderSessions(report, top));
+      out.push(renderSessions(report, top, multiAgent));
       break;
     case "tools":
       out.push(renderTools(report, top));
@@ -194,7 +231,9 @@ function emit(report, cmd, { o, top, print }) {
 /* ------------------------------------------------------------------ */
 
 function sessionBrief(s) {
-  return s && { id: s.id, project: s.project, firstTs: s.firstTs, lastTs: s.lastTs, humanTurns: s.humanTurns, compactions: s.compactions?.length ?? 0 };
+  const b = s && { id: s.id, project: s.project, firstTs: s.firstTs, lastTs: s.lastTs, humanTurns: s.humanTurns, compactions: s.compactions?.length ?? 0 };
+  if (b && s.agent) b.agent = s.agent;
+  return b;
 }
 
 function startOfDay(d) {
@@ -232,16 +271,32 @@ function daysOf(since) {
 
 /* ------------------------------------------------------------------ */
 
+const estFmt = (v, r) => (r.noPricing ? "n/a" : fmtUsd(v, r.unknownModel));
+const tokFmt = (row) => (row.estimated ? "~" : "") + fmtNum(totalTokens(row));
+
 const tokenCols = [
   { key: "input", label: "input", align: "r", fmt: fmtNum },
   { key: "output", label: "output", align: "r", fmt: fmtNum },
   { key: "cacheRead", label: "cache rd", align: "r", fmt: fmtNum },
   { key: "cacheWrite", label: "cache wr", align: "r", fmt: fmtNum },
   { key: "_hit", label: "hit", align: "r", fmt: (_, r) => fmtPct(cacheHitRate(r)) },
-  { key: "est", label: "est $", align: "r", fmt: (v, r) => fmtUsd(v, r.unknownModel) },
+  { key: "est", label: "est $", align: "r", fmt: estFmt },
 ];
 
-function renderSummary(r, top) {
+function agentTable(r) {
+  return table(r.byAgent, [
+    { key: "key", label: "agent" },
+    { key: "_sess", label: "sessions", align: "r", fmt: (_, row) => r.bySession.filter((s) => (s.session.agent || "claude") === row.key).length },
+    { key: "messages", label: "msgs", align: "r", fmt: fmtNum },
+    { key: "_tok", label: "tokens", align: "r", fmt: (_, row) => tokFmt(row) },
+    { key: "_hit", label: "hit", align: "r", fmt: (_, row) => fmtPct(cacheHitRate(row)) },
+    { key: "toolCalls", label: "tools", align: "r", fmt: fmtNum },
+    { key: "toolErrors", label: "errs", align: "r" },
+    { key: "est", label: "est $", align: "r", fmt: estFmt },
+  ]);
+}
+
+function renderSummary(r, top, multiAgent = false) {
   const t = r.totals;
   const parts = [];
   parts.push(heading("Totals"));
@@ -249,14 +304,18 @@ function renderSummary(r, top) {
     kv([
       ["sessions", `${r.sessionsIncluded}`],
       ["API messages", fmtNum(t.messages)],
-      ["tokens", `${fmtNum(totalTokens(t))}  (in ${fmtNum(t.input)} · out ${fmtNum(t.output)} · cache rd ${fmtNum(t.cacheRead)} · cache wr ${fmtNum(t.cacheWrite)})`],
+      ["tokens", `${fmtNum(totalTokens(t))}  (in ${fmtNum(t.input)} · out ${fmtNum(t.output)} · cache rd ${fmtNum(t.cacheRead)} · cache wr ${fmtNum(t.cacheWrite)})` + (t.estimated ? c.yellow("   ~ partly estimated from text length") : "")],
       ["cache hit", fmtPct(cacheHitRate(t))],
       ["thinking tokens", fmtNum(t.thinking)],
       ["tool calls", `${fmtNum(t.toolCalls)}  (${t.toolErrors} errors, ${fmtNum(t.resultChars)} chars returned, ~${fmtUsd(t.ctxCost)} context cost)`],
-      ["estimated cost", fmtUsd(t.est, t.unknownModel) + (t.sub ? `   (${fmtUsd(t.sub)} by subagents, ${fmtPct(t.est ? t.sub / t.est : 0)})` : "") + (t.unknownModel ? c.yellow("   some models missing from pricing.json") : "")],
+      ["estimated cost", (t.noPricing ? "n/a (no per-token billing)" : fmtUsd(t.est, t.unknownModel)) + (t.sub ? `   (${fmtUsd(t.sub)} by subagents, ${fmtPct(t.est ? t.sub / t.est : 0)})` : "") + (t.unknownModel ? c.yellow("   some models missing from pricing.json") : "")],
       ["reported cost", r.reported.sessions ? `${fmtUsd(r.reported.usd)}   (Claude Code cost-state, ${r.reported.sessions}/${r.reported.of} sessions, whole-session totals)` : "n/a"],
     ]),
   );
+  if (multiAgent && r.byAgent) {
+    parts.push(heading("By agent"));
+    parts.push(agentTable(r));
+  }
   parts.push(heading("By model"));
   parts.push(table(r.byModel, [{ key: "key", label: "model", max: 28 }, { key: "messages", label: "msgs", align: "r", fmt: fmtNum }, ...tokenCols]));
   parts.push(heading("Top tools"));
@@ -266,6 +325,31 @@ function renderSummary(r, top) {
   parts.push(heading("Top waste"));
   parts.push(r.waste.length ? wasteTable(interleaveByKind(r.waste, Math.min(top, 8))) : "nothing flagged");
   parts.push(c.dim("\nMore: ccledger waste · sessions · tools · context · advise · report · watch"));
+  return parts.join("\n");
+}
+
+function renderToday(r, { budget, multiAgent }) {
+  const t = r.totals;
+  const day = new Date().toLocaleDateString("sv-SE");
+  const parts = [heading(`Today (${day})`)];
+  const spend = t.noPricing ? "n/a (no per-token billing)" : `${fmtUsd(t.est, t.unknownModel)} est` + (r.reported.sessions ? `   (${fmtUsd(r.reported.usd)} reported for ${r.reported.sessions} session${r.reported.sessions > 1 ? "s" : ""}, whole-session totals)` : "");
+  parts.push(
+    kv([
+      ["spend", spend],
+      ["budget", budget ? formatBudget(t.est, budget, { prefix: "" }) + c.dim(`   (daily budget $${budget})`) : c.dim(`none set — use --budget <usd> or "budget" in ${configPath().replace(os.homedir(), "~")}`)],
+      ["sessions", `${r.sessionsIncluded}  ·  ${fmtNum(t.messages)} API messages  ·  ${(t.estimated ? "~" : "") + fmtNum(totalTokens(t))} tokens  ·  cache hit ${fmtPct(cacheHitRate(t))}`],
+      ["tool calls", `${fmtNum(t.toolCalls)}  (${t.toolErrors} errors, ~${fmtUsd(t.ctxCost)} context cost)`],
+      ["top waste", r.waste[0] ? `${r.waste[0].kind} ${r.waste[0].tool} ${r.waste[0].detail}${r.waste[0].count > 1 ? ` ×${r.waste[0].count}` : ""}${r.waste[0].usd ? ` (~${fmtUsd(r.waste[0].usd)})` : ""}` : "nothing flagged"],
+    ]),
+  );
+  if (multiAgent && r.byAgent?.length) {
+    parts.push(heading("By agent"));
+    parts.push(agentTable(r));
+  }
+  if (r.bySession.length) {
+    parts.push(heading("Sessions today"));
+    parts.push(renderSessionsTable(r.bySession.slice(0, 10), multiAgent));
+  }
   return parts.join("\n");
 }
 
@@ -291,24 +375,29 @@ function renderProjects(r, top) {
   ]);
 }
 
-function renderSessions(r, top) {
-  return heading("Sessions (most expensive first)") + "\n" + table(r.bySession.slice(0, top), [
+function renderSessionsTable(rows, multiAgent = false) {
+  return table(rows, [
     { key: "key", label: "session", fmt: (v) => short(v) },
+    ...(multiAgent ? [{ key: "session", label: "agent", fmt: (s) => s.agent || "claude" }] : []),
     { key: "session", label: "started", fmt: (s) => fmtDate(s.firstTs) },
     { key: "session", label: "project", fmt: (s) => s.project, max: 24 },
     { key: "session", label: "wall", align: "r", fmt: (s) => fmtDur(s.lastTs - s.firstTs) },
     { key: "session", label: "turns", align: "r", fmt: (s) => s.humanTurns },
     { key: "session", label: "cmp", align: "r", fmt: (s) => s.compactions?.length ?? s.compactions ?? 0 },
     { key: "messages", label: "msgs", align: "r", fmt: fmtNum },
-    { key: "_tok", label: "tokens", align: "r", fmt: (_, row) => fmtNum(totalTokens(row)) },
+    { key: "_tok", label: "tokens", align: "r", fmt: (_, row) => tokFmt(row) },
     { key: "_hit", label: "hit", align: "r", fmt: (_, row) => fmtPct(cacheHitRate(row)) },
     { key: "toolCalls", label: "tools", align: "r", fmt: fmtNum },
     { key: "toolErrors", label: "errs", align: "r" },
-    { key: "est", label: "est $", align: "r", fmt: (v, row) => fmtUsd(v, row.unknownModel) },
+    { key: "est", label: "est $", align: "r", fmt: estFmt },
     { key: "sub", label: "agents $", align: "r", fmt: (v) => (v ? fmtUsd(v) : "-") },
     { key: "reported", label: "reported $", align: "r", fmt: (v) => (v == null ? "-" : fmtUsd(v)) },
     { key: "linesAdded", label: "+/-", align: "r", fmt: (v, row) => (v == null ? "-" : `+${v}/-${row.linesRemoved}`) },
-  ]) + c.dim("\ncmp = compactions · agents $ = spent by subagents inside the session");
+  ]);
+}
+
+function renderSessions(r, top, multiAgent = false) {
+  return heading("Sessions (most expensive first)") + "\n" + renderSessionsTable(r.bySession.slice(0, top), multiAgent) + c.dim("\ncmp = compactions · agents $ = spent by subagents inside the session" + (multiAgent ? " · ~ = tokens estimated from text length · n/a = no per-token billing" : ""));
 }
 
 function toolTable(rows) {
@@ -396,6 +485,32 @@ function renderModels(r) {
   ]);
 }
 
+function compareCmd(model, pricing, { o, print, largeOutput }) {
+  let since = parseSince(o.since);
+  let until = parseUntil(o.until);
+  let beforeLabel = "before";
+  let afterLabel = "after";
+  const extra = [];
+  if (o.mark !== undefined) {
+    let m;
+    if (o.mark) {
+      m = addMarker(o.mark);
+      extra.push(c.dim(`Marker "${m.label}" stored at ${fmtDate(m.ts)} in ${statePath().replace(os.homedir(), "~")}. Re-run \`ccledger compare --mark\` later to compare before/after it.`));
+    } else {
+      m = findMarker();
+      if (!m) throw new Error(`No marker stored yet. Run: ccledger compare --mark "<label>"`);
+    }
+    since = m.ts;
+    until = undefined;
+    beforeLabel = `before "${m.label}"`;
+    afterLabel = `after "${m.label}"`;
+  }
+  const w = windows(model, { since, until, baseline: o.baseline });
+  const cmp = compare(model, pricing, { after: w.after, before: w.before, largeOutput, project: o.project });
+  if (o.json) return print(JSON.stringify(cmp, null, 2));
+  print([...extra, renderCompare(cmp, { beforeLabel, afterLabel })].join("\n"));
+}
+
 function calibrateCmd(report, pricing, { o, print }) {
   const cal = report.calibration;
   const parts = [heading("Calibration: Claude Code reported ÷ ccledger estimate")];
@@ -470,5 +585,6 @@ function footer(r) {
   const m = r.meta || {};
   const range = [r.range.since ? `since ${new Date(r.range.since).toLocaleDateString("sv-SE")}` : "all time", r.range.project ? `project~"${r.range.project}"` : null].filter(Boolean).join(", ");
   const dir = String(m.dir || "").replace(os.homedir(), "~");
-  return c.dim(`\n${m.files ?? "?"} files · ${fmtNum(m.lines || 0)} lines · ${range} · parsed in ${m.parseMs ?? 0}ms · ${dir}`);
+  const agents = m.agents ? ` · agents: ${m.agents.join(", ")}` : "";
+  return c.dim(`\n${m.files ?? "?"} files · ${fmtNum(m.lines || 0)} lines · ${range} · parsed in ${m.parseMs ?? 0}ms · ${dir}${agents}`);
 }

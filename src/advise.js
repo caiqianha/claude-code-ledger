@@ -77,3 +77,138 @@ export function advise(report, { max = 8, days } = {}) {
   lines.push(`<!-- ${fmtNum(report.totals.toolCalls)} tool calls, ~${fmtUsd(ctx)} of estimated context cost from tool results; top tools by context cost: ${report.byTool.slice().sort((a, b) => b.ctxCost - a.ctxCost).slice(0, 3).map((t) => `${t.key} ${fmtUsd(t.ctxCost)}`).join(", ")} -->`);
   return lines.join("\n");
 }
+
+/* ------------------------------------------------------------------ */
+/* CLAUDE.md suggestions: rules with the evidence that triggered them   */
+/* ------------------------------------------------------------------ */
+
+/** Thresholds a pattern must cross before its rule is suggested. Exported for tests and docs. */
+export const CLAUDE_MD_THRESHOLDS = {
+  rereadRate: 0.1, // share of file reads that re-read a file already in context
+  rereadMinReads: 10, // ...with at least this many file reads in the window
+  researchRate: 0.15,
+  researchMinSearches: 10,
+  reshellRate: 0.15,
+  reshellMinCalls: 10,
+  retries: 2, // identical re-runs right after a failure
+  largeOutputs: 2, // tool results over the --large threshold
+  errorRate: 0.25, // per tool, with at least errorMinCalls calls
+  errorMinCalls: 10,
+  coldSessions: 1,
+};
+
+const pct = (a, b) => (b ? Math.round((a / b) * 100) : 0);
+const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+
+/**
+ * Build the list of suggested rules from a report. Each rule: { id, rule, evidence, usd }.
+ * Only rules whose pattern crossed its threshold are returned, most expensive first.
+ */
+export function claudeMdRules(report, { large = 30_000, thresholds = CLAUDE_MD_THRESHOLDS } = {}) {
+  const T = thresholds;
+  const p = report.patterns || {};
+  const scope = `in the last ${plural(report.sessionsIncluded ?? p.sessions ?? 0, "session")}`;
+  const rules = [];
+  const topRepeats = (filter) => {
+    const m = new Map();
+    for (const f of report.waste) {
+      if (f.kind !== "repeat" || !filter(f.tool)) continue;
+      const g = m.get(f.detail) || { detail: f.detail, n: 0 };
+      g.n += f.count;
+      m.set(f.detail, g);
+    }
+    return [...m.values()].sort((a, b) => b.n - a.n).slice(0, 3);
+  };
+
+  if (p.reads >= T.rereadMinReads && p.rereads / p.reads >= T.rereadRate) {
+    const hot = topRepeats((t) => /read/i.test(t));
+    rules.push({
+      id: "reread",
+      usd: p.rereadUsd || 0,
+      rule: "Before reading a file, check whether it is already in context from an earlier Read; re-read only the part you need with `offset`/`limit`.",
+      evidence: `${pct(p.rereads, p.reads)}% of file reads (${p.rereads} of ${p.reads}) re-read a file that was already in context ${scope}${hot.length ? `; most repeated: ${hot.map((h) => `\`${h.detail}\` ×${h.n}`).join(", ")}` : ""}.`,
+    });
+  }
+  if (p.searches >= T.researchMinSearches && p.researches / p.searches >= T.researchRate) {
+    const hot = topRepeats((t) => /glob|grep|search|list/i.test(t));
+    rules.push({
+      id: "research",
+      usd: 0,
+      rule: "Do not repeat an identical Grep/Glob search; the earlier result is still in context. Note the paths you found and work from them.",
+      evidence: `${pct(p.researches, p.searches)}% of searches (${p.researches} of ${p.searches}) repeated an identical query ${scope}${hot.length ? `; most repeated: ${hot.map((h) => `\`${h.detail}\` ×${h.n}`).join(", ")}` : ""}.`,
+    });
+  }
+  if (p.shell >= T.reshellMinCalls && p.reshell / p.shell >= T.reshellRate) {
+    const hot = topRepeats((t) => /bash|shell|terminal|exec/i.test(t));
+    rules.push({
+      id: "reshell",
+      usd: 0,
+      rule: "Do not re-run a read-only command (ls, cat, git status, grep) whose output is already in context; reuse it.",
+      evidence: `${pct(p.reshell, p.shell)}% of shell commands (${p.reshell} of ${p.shell}) were exact repeats within one session ${scope}${hot.length ? `; most repeated: ${hot.map((h) => `\`${h.detail}\` ×${h.n}`).join(", ")}` : ""}.`,
+    });
+  }
+  if (p.retries >= T.retries) {
+    const hot = new Map();
+    for (const f of report.waste) if (f.kind === "retry") hot.set(f.detail, (hot.get(f.detail) || 0) + f.count);
+    const top = [...hot.entries()].sort((a, b) => b[1] - a[1]).slice(0, 2);
+    rules.push({
+      id: "retry",
+      usd: report.waste.filter((f) => f.kind === "retry").reduce((n, f) => n + (f.usd || 0), 0),
+      rule: "When a command or tool call fails, do not re-run it unchanged. Read the error, change the input or fix the cause, then retry once.",
+      evidence: `${p.retries} identical ${p.retries === 1 ? "retry" : "retries"} right after a failure ${scope}${top.length ? ` (e.g. ${top.map(([d, n]) => `\`${d}\` ×${n}`).join(", ")})` : ""}.`,
+    });
+  }
+  if (p.largeOutputs >= T.largeOutputs) {
+    const tools = Object.entries(p.largeByTool || {}).sort((a, b) => b[1] - a[1]);
+    const shellHeavy = tools[0] && /bash|shell|terminal|exec/i.test(tools[0][0]);
+    rules.push({
+      id: "large-output",
+      usd: p.largeUsd || 0,
+      rule: shellHeavy
+        ? "Keep shell output short: pipe through `head`, `tail -n 50` or `grep`, and never dump whole logs, test runs or build output into the conversation."
+        : "Keep tool output short: read files with `offset`/`limit`, narrow searches, and never load a whole log or generated file into the conversation.",
+      evidence: `${plural(p.largeOutputs, "tool result")} exceeded ${fmtNum(large)} characters ${scope} (largest ${fmtNum(p.largeChars)} chars, ~${fmtUsd(p.largeUsd || 0)} of context cost; mostly ${tools.slice(0, 2).map(([t, n]) => `${t} ×${n}`).join(", ")}).`,
+    });
+  }
+  for (const t of report.byTool) {
+    if (t.calls < T.errorMinCalls || t.errors / t.calls < T.errorRate) continue;
+    rules.push({
+      id: `error-prone:${t.key}`,
+      usd: 0,
+      rule: `\`${t.key}\` fails often here: check the working directory, permissions or required binaries before calling it, and stop after one failure instead of looping.`,
+      evidence: `\`${t.key}\` failed ${pct(t.errors, t.calls)}% of the time (${t.errors} of ${t.calls} calls) ${scope}.`,
+    });
+  }
+  if (p.coldSessions >= T.coldSessions) {
+    rules.push({
+      id: "cold-cache",
+      usd: 0,
+      rule: "Keep one task per session and start a new session after a break longer than an hour; a long idle session re-pays its whole context on the next turn.",
+      evidence: `${plural(p.coldSessions, "long session")} ran with a prompt-cache hit rate under 50% ${scope}.`,
+    });
+  }
+  rules.sort((a, b) => b.usd - a.usd);
+  return rules;
+}
+
+/** Render the rules as a paste-ready CLAUDE.md block with a short "how to apply" header. */
+export function claudeMdBlock(report, opts = {}) {
+  const rules = claudeMdRules(report, opts);
+  const today = new Date().toISOString().slice(0, 10);
+  const scope = opts.days ? `last ${opts.days} days` : "all sessions";
+  const lines = [];
+  lines.push(`<!-- ccledger suggestions · ${today} · ${scope} · ${report.sessionsIncluded} sessions, ${fmtNum(report.totals.toolCalls)} tool calls -->`);
+  lines.push("## Working rules (suggested by ccledger)");
+  lines.push("");
+  lines.push("How to apply: paste this section into `CLAUDE.md` (project root or `~/.claude/CLAUDE.md`), delete the rules that do not fit the project, and keep the evidence lines if you want future readers to know why a rule exists. Run `ccledger compare --mark \"claude.md rules\"` now and `ccledger compare --mark` in a week or two to see whether the patterns went away.");
+  lines.push("");
+  if (!rules.length) {
+    lines.push("- No pattern crossed its threshold; nothing to add. Re-run after more sessions.");
+  }
+  for (const r of rules) {
+    lines.push(`- ${r.rule}`);
+    lines.push(`  - evidence: ${r.evidence}`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}

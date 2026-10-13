@@ -1,9 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-10-13
 
+- **Other agents' logs**: `--agent claude|codex|gemini|cursor|all`. Readers for Codex CLI rollouts (`~/.codex/sessions`, token_count deltas, function_call/local_shell_call/custom_tool_call joined by call_id, compactions), Gemini CLI chat recordings (`~/.gemini/tmp/<hash>/chats/session-*.jsonl`, `$patch`/`$set` wrappers, legacy `.json`, subagents) and Cursor's `state.vscdb` (best effort, via the `sqlite3` CLI with projected `json_extract` columns; skipped with a message when `sqlite3` is missing). All readers produce one normalized turn model (`ingestTurn` in `src/parse.js`); the Claude parser now goes through it too and its output is byte-for-byte unchanged. Multi-agent runs add an `agent` column, a "By agent" table (CLI and HTML report) and `meta.agents`; single-agent Claude JSON exports keep their previous shape.
+- Token counts estimated from text length (Gemini messages without `tokens`, most Cursor bubbles) are flagged with `~`; Cursor sessions are never priced and show `n/a` instead of an unknown-model warning.
+- `pricing.json`: OpenAI gpt-5 family (5 / 5.1 / 5.2 / 5.3-codex / 5.4 / 5.5, mini / nano / pro, codex-mini), o-series (o1, o3, o3-mini, o3-pro, o4-mini), gpt-4.1 / 4o, and Gemini 2.5 / 3.x tables as list prices as of 2026-10. Same user override file applies.
+- `advise --claude-md [--out FILE]`: suggested CLAUDE.md rules, each only when its pattern crossed a threshold (`CLAUDE_MD_THRESHOLDS`) and each followed by the evidence that triggered it (re-read rate, repeated searches / commands, identical retries, large outputs, error-prone tools, cold-cache sessions), with a "how to apply" header.
+- `--budget <usd>` (also `budget` in `~/.config/ccledger/config.json` or `$CCLEDGER_BUDGET`): the statusline shows today's estimated spend vs budget, yellow `⚠` from 80%, red `⚠ over` from 100% (markers survive `NO_COLOR` / non-TTY). New `ccledger today` prints the same with today's sessions and top waste finding.
+- `ccledger compare [--since] [--until] [--baseline <30d|20 sessions>]`: before/after table of waste rate, avg tokens per session, cache hit rate, cost per session (est and reported), tool calls and error rate, with deltas and a one-line verdict. `--mark "<label>"` stores a timestamp marker in `~/.config/ccledger/state.json`; `compare --mark` compares before vs after the last marker.
+- New config module (`src/config.js`): `~/.config/ccledger/config.json` keys `budget`, `agent`, `large`.
 - `watch`: session file name is derived with `path.basename`, so Windows paths no longer show the full path.
 - CONTRIBUTING guide and issue templates.
+- Codex sessions recorded without `token_count` events are kept, with usage estimated from message length and flagged `~`.
 
 ## 0.3.0 - 2026-10-12
 

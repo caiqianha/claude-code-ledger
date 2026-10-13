@@ -1,0 +1,3 @@
+{"sessionId":"dddddddd-0000-4000-8000-000000000002","projectHash":"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f","startTime":"2026-10-06T10:00:51.000Z","lastUpdated":"2026-10-06T10:00:51.000Z","kind":"subagent","directories":["/home/demo/code/sample-site"]}
+{"id":"s1","timestamp":"2026-10-06T10:00:52.000Z","type":"user","content":"sub task"}
+{"id":"s2","timestamp":"2026-10-06T10:00:53.000Z","type":"gemini","content":"done","tokens":{"input":500,"output":50,"cached":0,"total":550},"model":"gemini-2.5-flash"}

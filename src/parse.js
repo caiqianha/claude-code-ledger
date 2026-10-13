@@ -1,5 +1,10 @@
 /**
- * Turn raw Claude Code JSONL records into a normalized model.
+ * Normalized session model shared by every log reader.
+ *
+ * Readers (src/agents/*.js) turn an agent's native log format into a stream of
+ * *turns* (see `ingestTurn` below for the shape); this module folds turns into the
+ * in-memory model that analyze.js consumes. The Claude Code reader lives here too
+ * (`buildModel`), because it is the reference implementation of the mapping.
  *
  * Privacy: this module reads token counts, tool names, tool input *keys*
  * (file paths / command previews) and result sizes. It never keeps
@@ -8,8 +13,18 @@
 
 const READ_LIKE = new Set(["Read", "Glob", "Grep", "Bash", "WebFetch", "WebSearch", "ToolSearch"]);
 
+/** Read-like tool names used by other agents (Codex, Gemini CLI, Cursor), see src/agents. */
+const READ_LIKE_FOREIGN = new Set([
+  // Codex
+  "shell", "local_shell", "exec_command", "container.exec", "read_file", "list_dir", "grep_files", "web_search",
+  // Gemini CLI
+  "run_shell_command", "glob", "search_file_content", "grep_search", "list_directory", "read_many_files", "google_web_search", "web_fetch",
+  // Cursor
+  "read_file_v2", "ripgrep_raw_search", "glob_file_search", "codebase_search", "grep_search_v2", "run_terminal_command_v2", "run_terminal_cmd", "list_dir_v2", "read_lints", "web_search_v2", "fetch_rules",
+]);
+
 export function isReadLike(name) {
-  return READ_LIKE.has(name) || name.startsWith("mcp__");
+  return READ_LIKE.has(name) || READ_LIKE_FOREIGN.has(name) || name.startsWith("mcp__");
 }
 
 export function emptyUsage() {
@@ -45,18 +60,38 @@ function projectName(rec) {
   return rec._projectDir || "unknown";
 }
 
-function stable(v) {
+/** Last path segment of a directory, for display. */
+export function baseName(p) {
+  if (!p) return null;
+  return String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
+}
+
+export function stable(v) {
   if (v === null || typeof v !== "object") return JSON.stringify(v);
   if (Array.isArray(v)) return "[" + v.map(stable).join(",") + "]";
   return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + stable(v[k])).join(",") + "}";
 }
+
+/**
+ * Tool names of other agents mapped onto the Claude Code tool whose input shape they
+ * resemble, so `describeInput` derives the same kind of key (path, command, pattern…).
+ * Readers normalize their input objects to Claude-style keys (file_path, command, pattern, path, query, url).
+ */
+const CANON = {
+  // Codex
+  shell: "Bash", local_shell: "Bash", exec_command: "Bash", "container.exec": "Bash", apply_patch: "Edit", read_file: "Read", list_dir: "Glob", grep_files: "Grep", web_search: "WebSearch",
+  // Gemini CLI
+  run_shell_command: "Bash", glob: "Glob", search_file_content: "Grep", grep_search: "Grep", list_directory: "Glob", read_many_files: "Read", write_file: "Write", replace: "Edit", google_web_search: "WebSearch", web_fetch: "WebFetch",
+  // Cursor
+  read_file_v2: "Read", ripgrep_raw_search: "Grep", grep_search_v2: "Grep", glob_file_search: "Glob", list_dir_v2: "Glob", run_terminal_command_v2: "Bash", run_terminal_cmd: "Bash", edit_file_v2: "Edit", edit_file: "Edit", write_file_v2: "Write", delete_file: "Write", codebase_search: "Grep", web_search_v2: "WebSearch", read_lints: "Read",
+};
 
 /** A stable identity for "the same call again", plus a short display preview. */
 export function describeInput(name, input) {
   if (!input || typeof input !== "object") return { key: name, preview: "" };
   const p = input.file_path || input.path || input.notebook_path || "";
   let key;
-  switch (name) {
+  switch (CANON[name] || name) {
     case "Read":
       key = `${p}${input.offset ? ` @${input.offset}` : ""}${input.limit ? ` +${input.limit}` : ""}`;
       break;
@@ -139,121 +174,219 @@ export function newModel() {
   };
 }
 
-function session(model, rec) {
-  const id = rec.sessionId || rec._fileSession;
+/* ------------------------------------------------------------------ */
+/* Normalized turns                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Fold one normalized turn into the model. Every reader yields turns of this shape:
+ *
+ *   {
+ *     agent: "claude" | "codex" | "gemini" | "cursor",
+ *     sessionId, ts: ms | null,
+ *     // session metadata, used on first sight (any turn may carry it):
+ *     cwd?, project?, projectDir?, file?, version?, gitBranch?, slug?,
+ *     kind: "message" | "cost" | "compaction" | "meta",
+ *     // kind "message":
+ *     role: "user" | "assistant",
+ *     id?: stable message id (streaming chunks repeat it; usage is max-merged),
+ *     model?, usage?: {input, output, cacheRead, cacheWrite5m, cacheWrite1h, thinking},
+ *     estimated?: true when usage was derived from text length (chars/4) rather than recorded,
+ *     stopReason?, sidechain?, humanTurn? (user text written by a person),
+ *     toolCalls?: [{ id, name, input }],            // assistant
+ *     toolResults?: [{ toolUseId, isError, chars }], // user
+ *     // kind "cost": cost = Claude Code cost-state record
+ *   }
+ *
+ * Turns are processed in file order; a turn whose kind is "meta" only touches session metadata.
+ */
+export function ingestTurn(model, t) {
+  model.stats.lines++;
+  const s = session(model, t);
+  const ts = t.ts ?? null;
+  const sidechain = t.sidechain === true;
+
+  if (t.kind === "message" && t.role === "assistant") {
+    const id = t.id;
+    if (!id) return;
+    let msg = model.messages.get(id);
+    const u = t.usage || emptyUsage();
+    if (!msg) {
+      msg = {
+        id,
+        sessionId: s.id,
+        model: t.model || "unknown",
+        ts,
+        seq: s.seq++,
+        sidechain,
+        usage: u,
+        toolUseIds: [],
+        stopReason: t.stopReason || null,
+      };
+      if (t.estimated) {
+        msg.estimated = true;
+        s.estimated = true;
+      }
+      model.messages.set(id, msg);
+    } else {
+      // Streaming splits one API message across several lines that repeat the same usage.
+      msg.usage = maxUsage(msg.usage, u);
+      if (t.stopReason) msg.stopReason = t.stopReason;
+    }
+    for (const b of t.toolCalls || []) {
+      if (!b || !b.id || model.toolUses.has(b.id)) continue;
+      const { key, preview } = describeInput(b.name || "unknown", b.input);
+      model.toolUses.set(b.id, {
+        id: b.id,
+        name: b.name || "unknown",
+        key,
+        preview,
+        inputChars: b.inputChars ?? (b.input ? stable(b.input).length : 0),
+        messageId: id,
+        model: msg.model,
+        sessionId: s.id,
+        sidechain,
+        ts: b.ts ?? ts,
+      });
+      msg.toolUseIds.push(b.id);
+    }
+    return;
+  }
+
+  if (t.kind === "message" && t.role === "user") {
+    if (t.humanTurn && !sidechain) s.humanTurns++;
+    for (const b of t.toolResults || []) {
+      if (!b || !b.toolUseId) continue;
+      model.toolResults.set(b.toolUseId, {
+        toolUseId: b.toolUseId,
+        isError: b.isError === true,
+        chars: b.chars || 0,
+        ts: b.ts ?? ts,
+      });
+    }
+    return;
+  }
+
+  if (t.kind === "cost") {
+    const rec = t.cost;
+    const prev = model.costStates.get(s.id);
+    if (!prev || (rec.totalDuration || 0) >= (prev.totalDuration || 0)) model.costStates.set(s.id, rec);
+    return;
+  }
+
+  if (t.kind === "compaction") {
+    s.compactions.push(ts === null ? s.lastTs || 0 : ts);
+  }
+}
+
+function session(model, t) {
+  const id = t.sessionId;
   let s = model.sessions.get(id);
   if (!s) {
     s = {
       id,
-      project: projectName(rec),
-      projectDir: rec._projectDir,
-      cwd: rec.cwd || null,
-      file: rec._file || null,
+      project: t.project || t.projectDir || "unknown",
+      projectDir: t.projectDir,
+      cwd: t.cwd || null,
+      file: t.file || null,
       firstTs: null,
       lastTs: null,
-      version: rec.version || null,
-      gitBranch: rec.gitBranch || null,
-      slug: rec.slug || null,
+      version: t.version || null,
+      gitBranch: t.gitBranch || null,
+      slug: t.slug || null,
       humanTurns: 0,
       compactions: [], // timestamps of compact_boundary records
       seq: 0,
     };
+    if (t.agent && t.agent !== "claude") s.agent = t.agent;
+    if (t.noPricing) s.noPricing = true; // agent without per-token billing (Cursor)
     model.sessions.set(id, s);
   }
-  if (rec.timestamp) {
-    const t = Date.parse(rec.timestamp);
-    if (!Number.isNaN(t)) {
-      if (s.firstTs === null || t < s.firstTs) s.firstTs = t;
-      if (s.lastTs === null || t > s.lastTs) s.lastTs = t;
-    }
+  if (t.ts != null) {
+    if (s.firstTs === null || t.ts < s.firstTs) s.firstTs = t.ts;
+    if (s.lastTs === null || t.ts > s.lastTs) s.lastTs = t.ts;
   }
-  if (!s.cwd && rec.cwd) {
-    s.cwd = rec.cwd;
-    s.project = projectName(rec);
+  if (!s.cwd && t.cwd) {
+    s.cwd = t.cwd;
+    s.project = t.project || baseName(t.cwd);
   }
-  if (!s.gitBranch && rec.gitBranch) s.gitBranch = rec.gitBranch;
-  if (!s.slug && rec.slug) s.slug = rec.slug;
+  if (!s.gitBranch && t.gitBranch) s.gitBranch = t.gitBranch;
+  if (!s.slug && t.slug) s.slug = t.slug;
   return s;
 }
 
-/** Consume an (async or sync) iterable of records into a model. Safe to call repeatedly (incremental). */
-export async function buildModel(records, model = newModel()) {
-  for await (const rec of records) {
-    model.stats.lines++;
-    const s = session(model, rec);
-    const ts = rec.timestamp ? Date.parse(rec.timestamp) : NaN;
-    const sidechain = rec.isSidechain === true;
+/** Consume an (async or sync) iterable of normalized turns into a model. */
+export async function ingestTurns(turns, model = newModel()) {
+  for await (const t of turns) ingestTurn(model, t);
+  return model;
+}
 
-    if (rec.type === "assistant" && rec.message) {
-      const m = rec.message;
-      const id = m.id || rec.uuid;
-      if (!id || m.model === "<synthetic>") continue;
-      let msg = model.messages.get(id);
-      const u = usageFrom(m.usage);
-      if (!msg) {
-        msg = {
-          id,
-          sessionId: s.id,
-          model: m.model || "unknown",
-          ts: Number.isNaN(ts) ? null : ts,
-          seq: s.seq++,
-          sidechain,
-          usage: u,
-          toolUseIds: [],
-          stopReason: m.stop_reason || null,
-        };
-        model.messages.set(id, msg);
-      } else {
-        // Streaming splits one API message across several lines that repeat the same usage.
-        msg.usage = maxUsage(msg.usage, u);
-        if (m.stop_reason) msg.stopReason = m.stop_reason;
-      }
-      const content = Array.isArray(m.content) ? m.content : [];
-      for (const b of content) {
-        if (!b || b.type !== "tool_use" || !b.id || model.toolUses.has(b.id)) continue;
-        const { key, preview } = describeInput(b.name || "unknown", b.input);
-        model.toolUses.set(b.id, {
-          id: b.id,
-          name: b.name || "unknown",
-          key,
-          preview,
-          inputChars: b.input ? stable(b.input).length : 0,
-          messageId: id,
-          model: msg.model,
-          sessionId: s.id,
-          sidechain,
-          ts: Number.isNaN(ts) ? null : ts,
-        });
-        msg.toolUseIds.push(b.id);
-      }
-      continue;
+/* ------------------------------------------------------------------ */
+/* Claude Code reader                                                    */
+/* ------------------------------------------------------------------ */
+
+/** Map one raw Claude Code JSONL record onto a normalized turn. */
+export function claudeTurn(rec) {
+  const ts = rec.timestamp ? Date.parse(rec.timestamp) : NaN;
+  const t = {
+    agent: "claude",
+    sessionId: rec.sessionId || rec._fileSession,
+    ts: Number.isNaN(ts) ? null : ts,
+    cwd: rec.cwd || null,
+    project: rec.cwd ? projectName(rec) : null,
+    projectDir: rec._projectDir,
+    file: rec._file || null,
+    version: rec.version || null,
+    gitBranch: rec.gitBranch || null,
+    slug: rec.slug || null,
+    sidechain: rec.isSidechain === true,
+    kind: "meta",
+  };
+  if (!t.project) t.project = rec._projectDir || "unknown";
+
+  if (rec.type === "assistant" && rec.message) {
+    const m = rec.message;
+    const id = m.id || rec.uuid;
+    if (!id || m.model === "<synthetic>") return t;
+    t.kind = "message";
+    t.role = "assistant";
+    t.id = id;
+    t.model = m.model || "unknown";
+    t.usage = usageFrom(m.usage);
+    t.stopReason = m.stop_reason || null;
+    const content = Array.isArray(m.content) ? m.content : [];
+    t.toolCalls = [];
+    for (const b of content) {
+      if (!b || b.type !== "tool_use" || !b.id) continue;
+      t.toolCalls.push({ id: b.id, name: b.name || "unknown", input: b.input });
     }
-
-    if (rec.type === "user" && rec.message) {
-      const content = rec.message.content;
-      if (isHumanTurn(content) && !rec.isMeta && !sidechain) s.humanTurns++;
-      if (!Array.isArray(content)) continue;
+    return t;
+  }
+  if (rec.type === "user" && rec.message) {
+    const content = rec.message.content;
+    t.kind = "message";
+    t.role = "user";
+    t.humanTurn = isHumanTurn(content) && !rec.isMeta;
+    t.toolResults = [];
+    if (Array.isArray(content)) {
       for (const b of content) {
         if (!b || b.type !== "tool_result" || !b.tool_use_id) continue;
-        model.toolResults.set(b.tool_use_id, {
-          toolUseId: b.tool_use_id,
-          isError: b.is_error === true,
-          chars: resultChars(b.content),
-          ts: Number.isNaN(ts) ? null : ts,
-        });
+        t.toolResults.push({ toolUseId: b.tool_use_id, isError: b.is_error === true, chars: resultChars(b.content) });
       }
-      continue;
     }
-
-    if (rec.type === "cost-state") {
-      const prev = model.costStates.get(s.id);
-      if (!prev || (rec.totalDuration || 0) >= (prev.totalDuration || 0)) model.costStates.set(s.id, rec);
-      continue;
-    }
-
-    if (rec.type === "system" && rec.subtype === "compact_boundary") {
-      s.compactions.push(Number.isNaN(ts) ? s.lastTs || 0 : ts);
-    }
+    return t;
   }
+  if (rec.type === "cost-state") {
+    t.kind = "cost";
+    t.cost = rec;
+    return t;
+  }
+  if (rec.type === "system" && rec.subtype === "compact_boundary") t.kind = "compaction";
+  return t;
+}
+
+/** Consume an (async or sync) iterable of raw Claude Code records into a model. Safe to call repeatedly (incremental). */
+export async function buildModel(records, model = newModel()) {
+  for await (const rec of records) ingestTurn(model, claudeTurn(rec));
   return model;
 }
